@@ -142,6 +142,9 @@ var (
 	peerIDs               []string
 	peerOfflineUntil      = make(map[string]time.Time)
 	peerFailureCount      = make(map[string]int)
+	pendingPeerMsgs       = make(map[string][]Message)
+	pendingPeerMutex      sync.Mutex
+	stateSynced           bool
 	replyChannels         = make(map[string]map[string]chan struct{})
 	replyChannelMutex     sync.Mutex
 	queueNotify           = make(chan struct{}, 1)
@@ -188,68 +191,16 @@ func normalizeDroneID(droneID string) string {
 	return strings.ReplaceAll(droneID, "_", "-")
 }
 
-// queueStateFilePath retorna o caminho do arquivo local usado para persistir o estado da fila de alertas.
-func queueStateFilePath() string {
-	return fmt.Sprintf("%s_queue_state.json", gatewayID)
-}
-
 // loadQueueState restaura o estado da fila de alertas apos reinicializacao para evitar perda de dados.
 func loadQueueState() {
-	path := queueStateFilePath()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	var saved []*AlertRequest
-	if err := json.Unmarshal(data, &saved); err != nil {
-		log.Printf("[GATEWAY/%s] Falha ao carregar estado da fila: %v", gatewayID, err)
-		return
-	}
-	stateMutex.Lock()
-	for _, req := range saved {
-		if req.RequestID == "" {
-			req.RequestID = fmt.Sprintf("%s:%d:%d", req.GatewayID, req.Timestamp, req.Lamport)
-		}
-		if seenAlerts[req.RequestID] {
-			continue
-		}
-		seenAlerts[req.RequestID] = true
-		reqQueue = append(reqQueue, req)
-	}
-	heap.Init(&reqQueue)
-	stateMutex.Unlock()
-	log.Printf("[GATEWAY/%s] Estado da fila restaurado com %d requisições pendentes", gatewayID, reqQueue.Len())
 }
 
 // persistQueueStateLocked grava o estado da fila de alertas de forma atomica quando o mutex ja esta travado.
 func persistQueueStateLocked() {
-	queueCopy := make([]*AlertRequest, 0, reqQueue.Len())
-	for _, req := range reqQueue {
-		copyReq := *req
-		queueCopy = append(queueCopy, &copyReq)
-	}
-	go func(dataToSave []*AlertRequest) {
-		data, err := json.Marshal(dataToSave)
-		if err != nil {
-			log.Printf("[GATEWAY/%s] Falha ao serializar estado da fila: %v", gatewayID, err)
-			return
-		}
-		tmpPath := fmt.Sprintf("%s.tmp", queueStateFilePath())
-		if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-			log.Printf("[GATEWAY/%s] Falha ao gravar estado temporário da fila: %v", gatewayID, err)
-			return
-		}
-		if err := os.Rename(tmpPath, queueStateFilePath()); err != nil {
-			log.Printf("[GATEWAY/%s] Falha ao atualizar arquivo de estado da fila: %v", gatewayID, err)
-		}
-	}(queueCopy)
 }
 
 // persistQueueState salva o estado atual da fila de alertas com bloqueio para evitar condicoes de corrida.
 func persistQueueState() {
-	stateMutex.Lock()
-	defer stateMutex.Unlock()
-	persistQueueStateLocked()
 }
 
 // notifyQueueProcessor acorda imediatamente o loop de processamento quando a fila muda de estado.
@@ -404,7 +355,7 @@ func main() {
 	go startServer(gatewayHost, regPort, handleRegConnection)
 	go startServer(gatewayHost, clientPort, handleClientConnection)
 
-	go syncStateOnStart()
+	syncStateOnStart()
 	go processQueueLoop()
 	go monitorLocalDroneHeartbeats()
 	go startPeerHealthMonitor()
@@ -1107,65 +1058,75 @@ func handleLocalDroneFailure(droneID, reason string) {
 // syncStateOnStart sincroniza o estado do gateway com peers ao iniciar para garantir consistencia inicial.
 func syncStateOnStart() {
 	time.Sleep(2 * time.Second)
-	msg := Message{Type: MsgSnapshotRequest, GatewayID: gatewayID, Lamport: tickLamport(0)}
-
 	for _, peerID := range peerIDs {
 		stateMutex.Lock()
 		if time.Now().Before(peerOfflineUntil[peerID]) {
 			stateMutex.Unlock()
 			continue
 		}
-		addr, ok := peerAddrsByID[peerID]
-		stateMutex.Unlock()
-		if !ok {
-			continue
-		}
-
-		log.Printf("[GATEWAY/%s] [SYNC] Solicitando estado de %s (%s)", gatewayID, peerID, addr)
-		dialer := &net.Dialer{}
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		conn, err := dialer.DialContext(ctx, "tcp", addr)
-		cancel()
-		if err != nil {
-			markPeerOffline(peerID, 10*time.Second, fmt.Sprintf("falha de conexão: %v", err))
-			log.Printf("[GATEWAY/%s] [SYNC] Peer %s offline ao conectar: %v", gatewayID, peerID, err)
-			continue
-		}
-
-		conn.SetDeadline(time.Now().Add(1 * time.Second))
-		if err := json.NewEncoder(conn).Encode(msg); err != nil {
-			conn.Close()
-			markPeerOffline(peerID, 10*time.Second, fmt.Sprintf("erro ao enviar snapshot request: %v", err))
-			log.Printf("[GATEWAY/%s] [SYNC] Falha ao enviar snapshot request para %s: %v", gatewayID, peerID, err)
-			continue
-		}
-
-		var reply Message
-		if err := json.NewDecoder(conn).Decode(&reply); err != nil {
-			conn.Close()
-			markPeerOffline(peerID, 10*time.Second, fmt.Sprintf("sem resposta ao snapshot: %v", err))
-			log.Printf("[GATEWAY/%s] [SYNC] Peer %s não respondeu snapshot: %v", gatewayID, peerID, err)
-			continue
-		}
-		conn.Close()
-
-		if reply.Type != MsgStateSync {
-			log.Printf("[GATEWAY/%s] [SYNC] Peer %s respondeu com tipo inesperado: %s", gatewayID, peerID, reply.Type)
-			continue
-		}
-
-		stateMutex.Lock()
-		reqQueue = make(PriorityQueue, 0)
-		seenAlerts = make(map[string]bool)
 		stateMutex.Unlock()
 
-		receiveStateSync(reply)
-		persistQueueState()
-		log.Printf("[GATEWAY/%s] [SYNC] Estado sincronizado com peer %s", gatewayID, peerID)
+		if err := syncStateFromPeer(peerID); err != nil {
+			log.Printf("[GATEWAY/%s] [SYNC] Falha ao sincronizar com %s: %v", gatewayID, peerID, err)
+			continue
+		}
 		return
 	}
 
 	log.Printf("[GATEWAY/%s] [SYNC] Nenhum peer disponível para sincronizar. Inicializando sem fila replicada.", gatewayID)
+}
+
+func syncStateFromPeer(peerID string) error {
+	stateMutex.Lock()
+	addr, ok := peerAddrsByID[peerID]
+	stateMutex.Unlock()
+	if !ok {
+		return fmt.Errorf("endereço do peer %s desconhecido", peerID)
+	}
+
+	log.Printf("[GATEWAY/%s] [SYNC] Solicitando estado de %s (%s)", gatewayID, peerID, addr)
+	dialer := &net.Dialer{}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	cancel()
+	if err != nil {
+		markPeerOffline(peerID, 10*time.Second, fmt.Sprintf("falha de conexão: %v", err))
+		return fmt.Errorf("falha de conexão no peer %s: %w", peerID, err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	msg := Message{Type: MsgSnapshotRequest, GatewayID: gatewayID, Lamport: tickLamport(0)}
+	if err := json.NewEncoder(conn).Encode(msg); err != nil {
+		markPeerOffline(peerID, 10*time.Second, fmt.Sprintf("erro ao enviar snapshot request: %v", err))
+		return fmt.Errorf("falha ao enviar snapshot request para %s: %w", peerID, err)
+	}
+
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+		markPeerOffline(peerID, 10*time.Second, fmt.Sprintf("sem resposta ao snapshot: %v", err))
+		return fmt.Errorf("sem resposta de snapshot de %s: %w", peerID, err)
+	}
+
+	if reply.Type != MsgStateSync {
+		return fmt.Errorf("peer %s respondeu com tipo inesperado: %s", peerID, reply.Type)
+	}
+
+	stateMutex.Lock()
+	reqQueue = make(PriorityQueue, 0)
+	seenAlerts = make(map[string]bool)
+	claimedAlerts = make(map[string]bool)
+	stateMutex.Unlock()
+
+	receiveStateSync(reply)
+	persistQueueState()
+
+	stateMutex.Lock()
+	stateSynced = true
+	stateMutex.Unlock()
+
+	log.Printf("[GATEWAY/%s] [SYNC] Estado sincronizado com peer %s", gatewayID, peerID)
+	return nil
 }
 
 // sendStateSync envia um snapshot local de estado a um peer solicitante.
@@ -1281,14 +1242,39 @@ func markPeerOffline(peerID string, duration time.Duration, reason string) {
 	log.Printf("[GATEWAY/%s] [PEER] Marcando peer %s offline por %s: %s", gatewayID, peerID, duration, reason)
 }
 
-// broadcastPeerMsg propaga mensagens criticas a todos os peers online com retry e disciplina de falha.
+// enqueuePendingPeerMessage armazena mensagens que devem ser reenviadas quando o peer voltar a ficar online.
+func enqueuePendingPeerMessage(peerID string, msg Message) {
+	pendingPeerMutex.Lock()
+	deferred := pendingPeerMsgs[peerID]
+	pendingPeerMsgs[peerID] = append(deferred, msg)
+	pendingPeerMutex.Unlock()
+}
+
+// sendPendingPeerMessages reenfileira mensagens pendentes para um peer recuperado.
+func sendPendingPeerMessages(peerID string) {
+	pendingPeerMutex.Lock()
+	msgs := pendingPeerMsgs[peerID]
+	delete(pendingPeerMsgs, peerID)
+	pendingPeerMutex.Unlock()
+
+	for _, msg := range msgs {
+		if err := sendDirectWithRetry(peerID, msg, 3); err != nil {
+			enqueuePendingPeerMessage(peerID, msg)
+			log.Printf("[GATEWAY/%s] [PEER] Re-enfileirando mensagem pendente para %s: %v", gatewayID, peerID, err)
+		}
+	}
+}
+
+// broadcastPeerMsg propaga mensagens criticas a todos os peers e enfileira tentativas para peers offline.
 func broadcastPeerMsg(msg Message) {
 	for _, peerID := range peerIDs {
 		if time.Now().Before(peerOfflineUntil[peerID]) {
+			enqueuePendingPeerMessage(peerID, msg)
 			continue
 		}
 		go func(pID string) {
 			if err := sendDirect(pID, msg); err != nil {
+				enqueuePendingPeerMessage(pID, msg)
 				log.Printf("[GATEWAY/%s] [PEER] Falha broadcast para %s: %v", gatewayID, pID, err)
 			}
 		}(peerID)
@@ -1398,10 +1384,15 @@ func sendPeerAck(conn net.Conn, msg Message) {
 // markPeerOnline reintegra peers recuperados a malha distribuida.
 func markPeerOnline(peerID string) {
 	stateMutex.Lock()
+	_, wasOffline := peerOfflineUntil[peerID]
 	delete(peerOfflineUntil, peerID)
 	peerFailureCount[peerID] = 0
 	stateMutex.Unlock()
 	log.Printf("[GATEWAY/%s] [PEER] Peer %s online", gatewayID, peerID)
+	go sendPendingPeerMessages(peerID)
+	if wasOffline {
+		go syncStateFromPeer(peerID)
+	}
 }
 
 // startPeerHealthMonitor monitora saude dos peers e preserva a malha contra falhas de gateway.

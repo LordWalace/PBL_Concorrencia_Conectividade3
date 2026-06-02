@@ -39,3 +39,5 @@ esac
 
 echo "Subindo drone para o setor: $sector -> $drone"
 docker compose -f device/docker-compose.yml up -d --build "$drone"
+echo "Mostrando logs de $drone..."
+docker compose -f device/docker-compose.yml logs -f "$drone"

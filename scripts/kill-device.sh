@@ -43,11 +43,11 @@ if [[ -z "$device" ]]; then
   exit 1
 fi
 
-if ! docker ps --format '{{.Names}}' | grep -qx "$device" && ! docker ps --format '{{.ID}}' | grep -qx "$device"; then
-  echo "Contêiner '$device' não está em execução ou não foi encontrado."
+if ! docker ps -a --format '{{.Names}}' | grep -qx "$device" && ! docker ps -a --format '{{.ID}}' | grep -qx "$device"; then
+  echo "Contêiner '$device' não foi encontrado."
   exit 1
 fi
 
-docker kill "$device"
+docker rm -f "$device"
 
-echo "Contêiner de drone '$device' derrubado com sucesso."
+echo "Contêiner de drone '$device' removido com sucesso."

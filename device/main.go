@@ -236,8 +236,9 @@ func sendHeartbeat() error {
 	stateMutex.Lock()
 	addr := currentGateway
 	status := statusValue
-	missionInfo := currentMissionInfo()
 	stateMutex.Unlock()
+
+	missionInfo := currentMissionInfo()
 
 	if addr == "" {
 		return fmt.Errorf("sem gateway atual")

@@ -43,11 +43,11 @@ if [[ -z "$container" ]]; then
   exit 1
 fi
 
-if ! docker ps --format '{{.Names}}' | grep -qx "$container" && ! docker ps --format '{{.ID}}' | grep -qx "$container"; then
-  echo "Contêiner '$container' não está em execução ou não foi encontrado."
+if ! docker ps -a --format '{{.Names}}' | grep -qx "$container" && ! docker ps -a --format '{{.ID}}' | grep -qx "$container"; then
+  echo "Contêiner '$container' não foi encontrado."
   exit 1
 fi
 
-docker kill "$container"
+docker rm -f "$container"
 
-echo "Contêiner de gateway '$container' derrubado com sucesso."
+echo "Contêiner de gateway '$container' removido com sucesso."

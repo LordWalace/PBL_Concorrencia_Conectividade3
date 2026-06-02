@@ -1,39 +1,30 @@
-version: "3.9"
 # Configuracao dos dispositivos moveis (drones)
 services:
   drone-norte:
-    build: .
+    build:
+      context: ${PWD}/device
+      dockerfile: Dockerfile
     container_name: drone-norte
     env_file: ../.env
-    environment:
-      - MISSION_DURATION=${MISSION_DURATION}
     network_mode: "host"
-    ports:
-      - "10000:10000"
   drone-sul:
-    build: .
+    build:
+      context: ${PWD}/device
+      dockerfile: Dockerfile
     container_name: drone-sul
     env_file: ../.env
-    environment:
-      - MISSION_DURATION=${MISSION_DURATION}
     network_mode: "host"
-    ports:
-      - "10001:10001"
   drone-leste:
-    build: .
+    build:
+      context: ${PWD}/device
+      dockerfile: Dockerfile
     container_name: drone-leste
     env_file: ../.env
-    environment:
-      - MISSION_DURATION=${MISSION_DURATION}
     network_mode: "host"
-    ports:
-      - "10002:10002"
   drone-oeste:
-    build: .
+    build:
+      context: ${PWD}/device
+      dockerfile: Dockerfile
     container_name: drone-oeste
     env_file: ../.env
-    environment:
-      - MISSION_DURATION=${MISSION_DURATION}
     network_mode: "host"
-    ports:
-      - "10003:10003"
