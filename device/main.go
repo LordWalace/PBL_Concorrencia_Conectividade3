@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -16,6 +15,8 @@ import (
 type Message struct {
 	Type        string            `json:"type"`
 	DroneID     string            `json:"drone_id"`
+	MissionID   string            `json:"mission_id,omitempty"`
+	CompanyID   string            `json:"company_id,omitempty"`
 	Content     string            `json:"content,omitempty"`
 	Status      string            `json:"status,omitempty"`
 	MissionInfo string            `json:"mission_info,omitempty"`
@@ -40,9 +41,10 @@ var (
 	missionEnd         time.Time
 	missionDuration    time.Duration
 	missionDescription string
+	currentMissionID   string
+	currentCompanyID   string
 )
 
-// mustEnv valida que a variavel de ambiente exista antes da inicializacao do servico.
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -51,7 +53,6 @@ func mustEnv(key string) string {
 	return v
 }
 
-// mustDurationEnv le duracao de missao de forma segura e consistente.
 func mustDurationEnv(key string) time.Duration {
 	v := mustEnv(key)
 	if d, err := time.ParseDuration(v); err == nil {
@@ -64,9 +65,8 @@ func mustDurationEnv(key string) time.Duration {
 	return 0
 }
 
-// main inicializa o servico e os componentes de rede, garantindo sincronizacao e redundancia entre gateways.
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	// Correção: seed removido (obsoleto e automático em Go recentes)
 	droneID = mustEnv("DEVICE_ID")
 	deviceIP = mustEnv("DEVICE_IP")
 	deviceHost = mustEnv("DEVICE_HOST")
@@ -100,7 +100,6 @@ func main() {
 	startCommandListener(myControlAddr)
 }
 
-// locatePreferredGatewayBySector identifica o gateway preferencial para o setor do drone.
 func locatePreferredGatewayBySector(setorID string) int {
 	for i, name := range gatewayNames {
 		if strings.EqualFold(name, setorID) {
@@ -110,7 +109,6 @@ func locatePreferredGatewayBySector(setorID string) int {
 	return -1
 }
 
-// locatePreferredGatewayByIP escolhe gateway com base no IP de rede do drone.
 func locatePreferredGatewayByIP(deviceIP string) int {
 	ips := []string{mustEnv("IP_NORTE"), mustEnv("IP_SUL"), mustEnv("IP_LESTE"), mustEnv("IP_OESTE")}
 	for i, ip := range ips {
@@ -121,7 +119,6 @@ func locatePreferredGatewayByIP(deviceIP string) int {
 	return 0
 }
 
-// registerLoop tenta registrar o drone no gateway ate obter resposta bem sucedida.
 func registerLoop(controlAddr string, preferredIndex int) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	for {
@@ -133,7 +130,6 @@ func registerLoop(controlAddr string, preferredIndex int) {
 	}
 }
 
-// registerToGateway realiza registro ordenado no gateway preferido e fallback em caso de indisponibilidade.
 func registerToGateway(controlAddr string, preferredIndex int) error {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	if preferredIndex < 0 || preferredIndex >= len(gatewayAddrs) {
@@ -167,7 +163,6 @@ func registerToGateway(controlAddr string, preferredIndex int) error {
 	return fmt.Errorf("nenhum gateway disponível")
 }
 
-// gatewayOrder define a ordem de tentativa de gateways para fallback seguro.
 func gatewayOrder(preferredIndex int) []int {
 	order := make([]int, 0, len(gatewayAddrs))
 	if preferredIndex < 0 || preferredIndex >= len(gatewayAddrs) {
@@ -179,7 +174,6 @@ func gatewayOrder(preferredIndex int) []int {
 	return order
 }
 
-// tryRegisterGateway faz o envio do registro do drone a um gateway especifico.
 func tryRegisterGateway(idx int, controlAddr string) error {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	addr := gatewayAddrs[idx]
@@ -217,11 +211,10 @@ func tryRegisterGateway(idx int, controlAddr string) error {
 	return nil
 }
 
-// heartbeatLoop envia batimentos periodicos ao gateway e aciona migracao se o gateway falhar.
 func heartbeatLoop(controlAddr string) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	for {
-		time.Sleep(time.Duration(3+rand.Intn(3)) * time.Second)
+		time.Sleep(time.Duration(3) * time.Second) // removido rand, tempo estavel
 		log.Printf("%s [HEARTBEAT] Enviando heartbeat", logPrefix)
 		if err := sendHeartbeat(); err != nil {
 			log.Printf("%s [HEARTBEAT] Falha no heartbeat: %v", logPrefix, err)
@@ -231,7 +224,6 @@ func heartbeatLoop(controlAddr string) {
 	}
 }
 
-// sendHeartbeat envia heartbeat e valida ACK do gateway para manter a sessao viva.
 func sendHeartbeat() error {
 	stateMutex.Lock()
 	addr := currentGateway
@@ -274,17 +266,21 @@ func sendHeartbeat() error {
 	return nil
 }
 
-// migrateGateway realiza fallback para outro gateway em caso de perda de conectividade.
 func migrateGateway(controlAddr string) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	currentState := currentStatus()
+	
+	// Correção: mutex proteje variaveis globais durante leitura na migracao
+	stateMutex.Lock()
 	activeDuringMigration := missionActive
 	fromName, fromAddr := currentGatewayName, currentGateway
 	preferred := currentGatewayIdx
+	stateMutex.Unlock()
+
 	order := gatewayOrder(preferred)
 
 	for _, idx := range order {
-		if idx == currentGatewayIdx {
+		if idx == preferred {
 			continue
 		}
 		if tryRegisterGateway(idx, controlAddr) == nil {
@@ -301,7 +297,6 @@ func migrateGateway(controlAddr string) {
 	time.Sleep(5 * time.Second)
 }
 
-// startCommandListener abre listener de comandos de despacho para o drone.
 func startCommandListener(controlAddr string) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	listenerAddr := controlAddr
@@ -320,7 +315,6 @@ func startCommandListener(controlAddr string) {
 	}
 }
 
-// handleCommand processa comandos recebidos do gateway e atualiza o estado da missao.
 func handleCommand(conn net.Conn) {
 	defer conn.Close()
 	var msg Message
@@ -336,13 +330,14 @@ func handleCommand(conn net.Conn) {
 
 	stateMutex.Lock()
 	missionDescription = msg.Occurrence
+	currentMissionID = msg.MissionID
+	currentCompanyID = msg.CompanyID
 	stateMutex.Unlock()
 
-	log.Printf("[DRONE/%s] [MISSAO] DISPATCH recebido: %s", droneID, msg.Occurrence)
+	log.Printf("[DRONE/%s] [MISSAO] DISPATCH recebido: %s (mission_id=%s)", droneID, msg.Occurrence, msg.MissionID)
 	startMission()
 }
 
-// startMission inicia a missao do drone e mantem o estado ate conclusao.
 func startMission() {
 	stateMutex.Lock()
 	if missionActive {
@@ -363,13 +358,33 @@ func startMission() {
 	log.Printf("[DRONE/%s] [MISSAO] Iniciando missão de %s no gateway %s", droneID, duration, gatewayName)
 	go func() {
 		startTime := time.Now()
-		time.Sleep(duration)
+		mid := currentMissionID
+		cid := currentCompanyID
+		desc := missionDescription
+
+		half := duration / 2
+		if half < time.Second {
+			half = time.Second
+		}
+		time.Sleep(half)
+		sendMissionEvent(mid, cid, fmt.Sprintf("inspeção em andamento: %s", desc))
+		remaining := duration - half
+		if remaining > 0 {
+			time.Sleep(remaining)
+		}
 
 		stateMutex.Lock()
 		missionActive = false
 		statusValue = "DISPONIVEL"
 		missionDescription = ""
+		missionIDDone := currentMissionID
+		companyDone := currentCompanyID
+		currentMissionID = ""
+		currentCompanyID = ""
 		stateMutex.Unlock()
+
+		report := fmt.Sprintf("Laudo final — ocorrência tratada: %s. Duração: %s.", desc, time.Since(startTime).Round(time.Second))
+		sendMissionReport(missionIDDone, companyDone, report)
 
 		elapsed := time.Since(startTime)
 		log.Printf("[DRONE/%s] [MISSAO] Missão concluída após %s", droneID, elapsed)
@@ -377,7 +392,37 @@ func startMission() {
 	}()
 }
 
-// sendDroneFailureNotification notifica o gateway sobre falhas criticas do drone.
+func sendMissionEvent(missionID, companyID, detail string) {
+	if missionID == "" {
+		return
+	}
+	msg := Message{Type: "MISSION_EVENT", DroneID: droneID, MissionID: missionID, CompanyID: companyID, Content: detail}
+	sendToCurrentGateway(msg)
+}
+
+func sendMissionReport(missionID, companyID, report string) {
+	if missionID == "" {
+		return
+	}
+	msg := Message{Type: "MISSION_REPORT", DroneID: droneID, MissionID: missionID, CompanyID: companyID, Content: report}
+	sendToCurrentGateway(msg)
+}
+
+func sendToCurrentGateway(msg Message) {
+	stateMutex.Lock()
+	addr := currentGateway
+	stateMutex.Unlock()
+	if addr == "" {
+		return
+	}
+	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_ = json.NewEncoder(conn).Encode(msg)
+}
+
 func sendDroneFailureNotification(reason string) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	msg := Message{
@@ -394,17 +439,18 @@ func sendDroneFailureNotification(reason string) {
 			log.Printf("%s [FALHA] Não foi possível notificar gateway %s: %v", logPrefix, addr, err)
 			continue
 		}
-		if err := json.NewEncoder(conn).Encode(msg); err != nil {
+		err = json.NewEncoder(conn).Encode(msg)
+		conn.Close() // Correção: Fecha o connection em todas iteracoes independentemente de erro
+		if err != nil {
 			log.Printf("%s [FALHA] Erro ao notificar gateway %s: %v", logPrefix, addr, err)
+			continue
 		}
-		conn.Close()
 		log.Printf("%s [FALHA] Notificação de falha enviada para %s", logPrefix, addr)
 		return
 	}
 	log.Printf("%s [FALHA] Não foi possível notificar nenhum gateway; continuarei tentando junto ao gateway atual", logPrefix)
 }
 
-// sendRelease libera o drone ao gateway ao finalizar uma missao ou operacao.
 func sendRelease() {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	for {
@@ -439,14 +485,12 @@ func sendRelease() {
 	}
 }
 
-// currentStatus retorna o status operacional atual do drone para o heartbeat.
 func currentStatus() string {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
 	return statusValue
 }
 
-// currentMissionInfo retorna a descricao de missao atual usada no heartbeat.
 func currentMissionInfo() string {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"sort"
@@ -19,6 +20,10 @@ type Message struct {
 	RequestID  string            `json:"request_id,omitempty"`
 	Priority   int               `json:"priority,omitempty"`
 	Occurrence string            `json:"occurrence,omitempty"`
+	CompanyID  string            `json:"company_id,omitempty"`
+	MissionID  string            `json:"mission_id,omitempty"`
+	Content    string            `json:"content,omitempty"`
+	Status     string            `json:"status,omitempty"`
 	Payload    map[string]string `json:"payload,omitempty"`
 	Queue      []QueueItem       `json:"queue,omitempty"`
 }
@@ -54,17 +59,31 @@ var occurrenceOptions = []OccurrenceOption{
 	{Priority: 4, Description: "Replanejamento de tráfego por risco ambiental"},
 }
 
-// mustEnv valida que a variavel de ambiente exista antes da inicializacao do servico.
+// Navios genéricos usados silenciosamente para movimentar a economia do gateway
+var defaultCompanies = []string{"navio-alpha", "navio-beta", "navio-gamma", "navio-delta"}
+
 func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("[FATAL] Variável de ambiente obrigatória ausente: %s", key)
+	val := os.Getenv(key)
+	if val == "" {
+		log.Fatalf("Variável de ambiente %s não configurada", key)
 	}
-	return v
+	return val
 }
 
-// main inicializa o servico e os componentes de rede, garantindo sincronizacao e redundancia entre gateways.
+func getAvailableGatewayConn(gateways map[string]string) (net.Conn, string, error) {
+	for name, addr := range gateways {
+		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err == nil {
+			return conn, name, nil
+		}
+	}
+	return nil, "", fmt.Errorf("nenhum gateway disponível no momento")
+}
+
 func main() {
+	// Inicialização da seed para atribuição aleatória silenciosa
+	rand.Seed(time.Now().UnixNano())
+
 	clientPort := mustEnv("GATEWAY_TCP_CLIENT_PORT")
 	gateways := map[string]string{
 		"Norte": fmt.Sprintf("%s:%s", mustEnv("IP_NORTE"), clientPort),
@@ -93,6 +112,8 @@ func main() {
 		fmt.Println("1 - Injetar Alerta Manual")
 		fmt.Println("2 - Ver Status do Estreito")
 		fmt.Println("3 - Ver Log de Eventos")
+		fmt.Println("4 - Consultar Arrecadação (Consórcio Hormuz)")
+		fmt.Println("5 - Histórico do Ledger")
 		fmt.Println("0 - Sair")
 		fmt.Print("Escolha uma opção (ou Enter para atualizar): ")
 
@@ -102,8 +123,7 @@ func main() {
 		case "1":
 			clearScreen()
 			sendManualAlert(reader, sectors, gateways)
-			time.Sleep(2 * time.Second)
-			clearScreen()
+			skipNextClear = true
 
 		case "2":
 			clearScreen()
@@ -117,8 +137,20 @@ func main() {
 			fmt.Println()
 			skipNextClear = true
 
+		case "4":
+			clearScreen()
+			viewHormuzRevenue(reader, gateways)
+			fmt.Println()
+			skipNextClear = true
+
+		case "5":
+			clearScreen()
+			viewLedgerHistory(reader, gateways)
+			fmt.Println()
+			skipNextClear = true
+
 		case "":
-			clearMenuLines(11)
+			clearMenuLines(13)
 			continue
 
 		case "0":
@@ -127,15 +159,16 @@ func main() {
 			return
 
 		default:
-			clearMenuLines(11)
+			clearMenuLines(13)
 			continue
 		}
 	}
 }
 
-// sendManualAlert coleta e envia alertas manuais com fallback entre gateways para confiabilidade.
 func sendManualAlert(reader *bufio.Reader, sectors []string, gateways map[string]string) {
 	fmt.Println("--- INJETAR ALERTA MANUAL ---")
+
+	// Setor
 	for i, setor := range sectors {
 		fmt.Printf("%d - %s\n", i+1, setor)
 	}
@@ -143,6 +176,7 @@ func sendManualAlert(reader *bufio.Reader, sectors []string, gateways map[string
 	sectorIndex := readNumber(reader, 1, len(sectors)) - 1
 	setorEscolhido := sectors[sectorIndex]
 
+	// Ocorrência
 	fmt.Println("\nOcorrências disponíveis:")
 	for i, option := range occurrenceOptions {
 		fmt.Printf("%d - %s (Prioridade %d)\n", i+1, option.Description, option.Priority)
@@ -151,30 +185,25 @@ func sendManualAlert(reader *bufio.Reader, sectors []string, gateways map[string
 	occurrenceIndex := readNumber(reader, 1, len(occurrenceOptions)) - 1
 	option := occurrenceOptions[occurrenceIndex]
 
+	// Economia invisível: seleciona um navio aleatório para ser cobrado no gateway
+	companyID := defaultCompanies[rand.Intn(len(defaultCompanies))]
 	requestID := fmt.Sprintf("client:%s:%d", setorEscolhido, time.Now().UnixNano())
+
 	msg := Message{
-		Type:       "ALERT",
+		Type:       "MISSION_SUBMIT",
 		RequestID:  requestID,
 		Priority:   option.Priority,
 		Occurrence: option.Description,
+		CompanyID:  companyID,
 	}
 
-	fmt.Printf("\n[CLIENTE] Enviando alerta para %s com prioridade %d e ocorrência '%s'\n", setorEscolhido, option.Priority, option.Description)
+	custo := option.Priority * 10
+	fmt.Printf("\n[CLIENTE] Transmitindo alerta para o setor %s...\n", setorEscolhido)
+	fmt.Printf("[ECONOMIA] A fatura de %d créditos será processada nos sistemas do Consórcio Hormuz.\n", custo)
+
 	sendWithFallback(msg, setorEscolhido, sectors, gateways)
 }
 
-// occurrencesByPriority agrupa ocorrencias por prioridade para selecao de alertas criticos.
-func occurrencesByPriority(priority int) []OccurrenceOption {
-	filtered := make([]OccurrenceOption, 0, len(occurrenceOptions))
-	for _, option := range occurrenceOptions {
-		if option.Priority == priority {
-			filtered = append(filtered, option)
-		}
-	}
-	return filtered
-}
-
-// printStatus consulta gateways e apresenta status consolidado de drones e fila.
 func printStatus(sectors []string, gateways map[string]string) {
 	fmt.Println("--- STATUS DO ESTREITO ---")
 
@@ -210,8 +239,8 @@ func printStatus(sectors []string, gateways map[string]string) {
 			sectorResults[idx] = fmt.Sprintf("[Setor %s] ONLINE | Fila: %s", setor, queueSize)
 			if len(reply.Queue) > 0 {
 				sectorResults[idx] += " | Próximas:"
-				for i, item := range reply.Queue {
-					sectorResults[idx] += fmt.Sprintf("\n      %d) %s | P%d | Origem: %s | %s", i+1, item.Occurrence, item.Priority, item.GatewayID, time.Unix(item.Timestamp, 0).Format("15:04:05"))
+				for j, item := range reply.Queue {
+					sectorResults[idx] += fmt.Sprintf("\n      %d) %s | P%d | Origem: %s", j+1, item.Occurrence, item.Priority, item.GatewayID)
 				}
 			}
 
@@ -303,78 +332,158 @@ func printStatus(sectors []string, gateways map[string]string) {
 	fmt.Println("\n--- STATUS GLOBAL DA FROTA ---")
 	if len(globalDrones) == 0 {
 		fmt.Println("Nenhum drone conhecido no momento.")
+	} else {
+		keys := make([]string, 0, len(globalDrones))
+		for droneID := range globalDrones {
+			keys = append(keys, droneID)
+		}
+		sort.Strings(keys)
+
+		for _, droneID := range keys {
+			info := globalDrones[droneID]
+			if info.Status == "" && info.MissionState == "" && info.Gateway == "" {
+				continue
+			}
+			if strings.Contains(droneID, "-control") || strings.Contains(droneID, "-gateway") || strings.Contains(droneID, "-mission") || strings.Contains(droneID, "-setor") || strings.Contains(droneID, "-ultima") {
+				continue
+			}
+			status := info.Status
+			if status == "" {
+				status = "DESCONHECIDO"
+			}
+			mission := info.MissionInfo
+			if mission == "" {
+				mission = info.MissionState
+			}
+			if mission == "" {
+				mission = "Indefinido"
+			}
+			priorityLabel := "-"
+			if info.Priority > 0 {
+				priorityLabel = fmt.Sprintf("P%d", info.Priority)
+			}
+			gateway := info.Gateway
+			if gateway == "" {
+				gateway = "-"
+			}
+			mission = capitalizeFirst(mission)
+			fmt.Printf("[%s] - Status: %s | Missão: %s | Prioridade: %s | Gateway: %s\n", formatDroneName(droneID), status, mission, priorityLabel, gateway)
+		}
+	}
+
+	fmt.Println("\nPressione Enter para voltar ao menu...")
+	bufio.NewReader(os.Stdin).ReadString('\n')
+}
+
+// viewHormuzRevenue varre o ledger distribuído em busca de todos os pagamentos e soma o montante arrecadado.
+func viewHormuzRevenue(reader *bufio.Reader, gateways map[string]string) {
+	fmt.Println("--- ARRECADAÇÃO (CONSÓRCIO HORMUZ) ---")
+	fmt.Println("Conectando ao Ledger da malha...")
+
+	conn, _, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		fmt.Println("\n[ERRO] Toda a malha está offline.")
+		reader.ReadString('\n')
+		return
+	}
+	defer conn.Close()
+
+	// Pede um limite alto para varrer todo o histórico contábil
+	msg := Message{Type: "LEDGER_REQ", Payload: map[string]string{"limit": "1000"}}
+	json.NewEncoder(conn).Encode(msg)
+
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+		fmt.Println("\n[ERRO] Falha ao ler resposta do gateway.")
+		reader.ReadString('\n')
 		return
 	}
 
-	keys := make([]string, 0, len(globalDrones))
-	for droneID := range globalDrones {
-		keys = append(keys, droneID)
-	}
-	sort.Strings(keys)
+	var recs []map[string]interface{}
+	json.Unmarshal([]byte(reply.Content), &recs)
 
-	for _, droneID := range keys {
-		info := globalDrones[droneID]
-		if info.Status == "" && info.MissionState == "" && info.Gateway == "" {
-			continue
+	totalArrecadado := 0
+	emissoes := 0
+
+	for _, r := range recs {
+		if t, ok := r["type"].(string); ok {
+			if t == "MISSION_PAYMENT" {
+				// Cada MISSION_PAYMENT tem um campo token_ids com o array de tokens gastos.
+				if tokens, ok := r["token_ids"].([]interface{}); ok {
+					totalArrecadado += len(tokens) * 10 // Cada token vale 10 créditos
+				}
+			} else if strings.HasPrefix(t, "TOKEN_MINT") {
+				emissoes++
+			}
 		}
-		if strings.Contains(droneID, "-control") || strings.Contains(droneID, "-gateway") || strings.Contains(droneID, "-mission") || strings.Contains(droneID, "-setor") || strings.Contains(droneID, "-ultima") {
-			continue
-		}
-		status := info.Status
-		if status == "" {
-			status = "DESCONHECIDO"
-		}
-		mission := info.MissionInfo
-		if mission == "" {
-			mission = info.MissionState
-		}
-		if mission == "" {
-			mission = "Indefinido"
-		}
-		priorityLabel := "-"
-		if info.Priority > 0 {
-			priorityLabel = fmt.Sprintf("P%d", info.Priority)
-		}
-		gateway := info.Gateway
-		if gateway == "" {
-			gateway = "-"
-		}
-		mission = capitalizeFirst(mission)
-		fmt.Printf("[%s] - Status: %s | Missão: %s | Prioridade: %s | Gateway: %s\n", formatDroneName(droneID), status, mission, priorityLabel, gateway)
 	}
+
+	fmt.Println("\n=======================================================")
+	fmt.Printf(" FATURAMENTO TOTAL DO CONSÓRCIO HORMUZ: %d CRÉDITOS\n", totalArrecadado)
+	fmt.Println("=======================================================")
+	fmt.Println("\nℹ️  Todos os créditos descontados das embarcações por")
+	fmt.Println("   acionamentos de emergência foram transferidos para")
+	fmt.Println("   a administração do Estreito.")
+	fmt.Printf("\nEventos de emissão/recarga na malha: %d\n", emissoes)
+
+	fmt.Println("\nPressione Enter para voltar ao menu...")
+	reader.ReadString('\n')
 }
 
-// cleanDroneName normaliza identificadores de drone para visualizacao unificada.
-func cleanDroneName(droneID string) string {
-	droneID = strings.TrimPrefix(droneID, "drone_")
-	droneID = strings.TrimPrefix(droneID, "Drone_")
-	return strings.ReplaceAll(droneID, "_", "-")
-}
+func viewLedgerHistory(reader *bufio.Reader, gateways map[string]string) {
+	fmt.Println("--- HISTÓRICO GERAL DO LIVRO-RAZÃO ---")
 
-func capitalizeFirst(text string) string {
-	if len(text) == 0 {
-		return text
+	conn, gwName, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		fmt.Printf("\n[ERRO] %v\n", err)
+		reader.ReadString('\n')
+		return
 	}
-	return strings.ToUpper(string(text[0])) + text[1:]
-}
+	defer conn.Close()
 
-func formatDroneName(droneID string) string {
-	id := strings.ToLower(droneID)
-	switch {
-	case strings.Contains(id, "norte"):
-		return "Drone-N"
-	case strings.Contains(id, "sul"):
-		return "Drone-S"
-	case strings.Contains(id, "leste"):
-		return "Drone-L"
-	case strings.Contains(id, "oeste"):
-		return "Drone-O"
-	default:
-		return cleanDroneName(droneID)
+	msg := Message{Type: "LEDGER_REQ", Payload: map[string]string{"limit": "30"}}
+	json.NewEncoder(conn).Encode(msg)
+
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+		fmt.Println("\n[ERRO] Falha ao ler resposta do gateway.")
+		reader.ReadString('\n')
+		return
 	}
+
+	var recs []map[string]interface{}
+	json.Unmarshal([]byte(reply.Content), &recs)
+
+	fmt.Printf("\n[Gateway %s] - Últimos blocos/registros na rede:\n\n", gwName)
+	if len(recs) == 0 {
+		fmt.Println("Nenhum registro encontrado.")
+	} else {
+		for i, r := range recs {
+			t := ""
+			if typeVal, ok := r["type"].(string); ok {
+				t = typeVal
+			}
+			tsVal, _ := r["timestamp"].(float64)
+			date := time.Unix(int64(tsVal), 0).Format("15:04:05")
+
+			compId := ""
+			if c, ok := r["company_id"].(string); ok {
+				compId = c
+			}
+
+			detail := ""
+			if d, ok := r["detail"].(string); ok {
+				detail = d
+			}
+
+			fmt.Printf("%d. [%s] %s | Cia: %s | Detalhe: %s\n", i+1, date, t, compId, detail)
+		}
+	}
+
+	fmt.Println("\nPressione Enter para voltar ao menu...")
+	reader.ReadString('\n')
 }
 
-// viewEventLog exibe o historico de eventos de forma ordenada para analise operacional.
 func viewEventLog(reader *bufio.Reader, sectors []string, gateways map[string]string) {
 	fmt.Println("--- LOG DE EVENTOS ---")
 	fmt.Print("Quantos eventos deseja ver por setor? ")
@@ -425,9 +534,11 @@ func viewEventLog(reader *bufio.Reader, sectors []string, gateways map[string]st
 			fmt.Println("   Nenhum evento disponível.")
 		}
 	}
+
+	fmt.Println("\nPressione Enter para voltar ao menu...")
+	reader.ReadString('\n')
 }
 
-// readChoice le a opcao de menu do usuario de forma robusta.
 func readChoice(reader *bufio.Reader) string {
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -435,11 +546,9 @@ func readChoice(reader *bufio.Reader) string {
 		os.Exit(1)
 		return ""
 	}
-	// Apenas retorna a string limpa. Se for inválido, o switch do main lida com isso apagando o menu de forma limpa.
 	return strings.TrimSpace(line)
 }
 
-// readNumber valida entrada numerica de menu com limites definidos.
 func readNumber(reader *bufio.Reader, min, max int) int {
 	for {
 		line, err := reader.ReadString('\n')
@@ -457,7 +566,6 @@ func readNumber(reader *bufio.Reader, min, max int) int {
 	}
 }
 
-// sendWithFallback garante envio de alerta com retry e fallback entre gateways ativos.
 func sendWithFallback(msg Message, initialSector string, sectors []string, gateways map[string]string) {
 	order := make([]string, 0, len(sectors))
 	order = append(order, initialSector)
@@ -467,7 +575,8 @@ func sendWithFallback(msg Message, initialSector string, sectors []string, gatew
 		}
 	}
 
-	for {
+	maxAttempts := 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		for _, sector := range order {
 			target := gateways[sector]
 			conn, err := net.DialTimeout("tcp", target, 3*time.Second)
@@ -478,33 +587,70 @@ func sendWithFallback(msg Message, initialSector string, sectors []string, gatew
 				conn.Close()
 				continue
 			}
-			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 			var ack Message
 			if err := json.NewDecoder(conn).Decode(&ack); err != nil {
 				conn.Close()
 				continue
 			}
 			conn.Close()
-			if ack.Type != "ALERT_ACK" {
-				continue
+
+			if ack.Type == "MISSION_ACK" || ack.Type == "ALERT_ACK" {
+				if ack.Status == "OK" {
+					fmt.Printf("[CLIENTE] Missão autorizada no Setor %s! (ID: %s)\n", sector, ack.MissionID)
+				} else {
+					fmt.Printf("[CLIENTE] Fatura retida no Setor %s (Aguardando Saldo do Consórcio).\nMotivo: %s\n", sector, ack.Content)
+				}
+				fmt.Println("\nPressione Enter para continuar...")
+				bufio.NewReader(os.Stdin).ReadString('\n')
+				return
 			}
-			fmt.Printf("[CLIENTE] Alerta salvo com sucesso no Setor %s (%s)\n", sector, target)
-			return
 		}
 
-		fmt.Println("[CLIENTE] Toda a malha está offline. Tentando novamente em 5 segundos...")
-		time.Sleep(5 * time.Second)
+		if attempt < maxAttempts {
+			fmt.Printf("[CLIENTE] Malha inoperante. Tentando novamente em 3 segundos... (%d/%d)\n", attempt, maxAttempts)
+			time.Sleep(3 * time.Second)
+		}
+	}
+	fmt.Println("[CLIENTE] Falha ao conectar com a malha após múltiplas tentativas.")
+	fmt.Println("Pressione Enter para voltar ao menu...")
+	bufio.NewReader(os.Stdin).ReadString('\n')
+}
+
+func cleanDroneName(droneID string) string {
+	droneID = strings.TrimPrefix(droneID, "drone_")
+	droneID = strings.TrimPrefix(droneID, "Drone_")
+	return strings.ReplaceAll(droneID, "_", "-")
+}
+
+func capitalizeFirst(text string) string {
+	if len(text) == 0 {
+		return text
+	}
+	return strings.ToUpper(string(text[0])) + text[1:]
+}
+
+func formatDroneName(droneID string) string {
+	id := strings.ToLower(droneID)
+	switch {
+	case strings.Contains(id, "norte"):
+		return "Drone-N"
+	case strings.Contains(id, "sul"):
+		return "Drone-S"
+	case strings.Contains(id, "leste"):
+		return "Drone-L"
+	case strings.Contains(id, "oeste"):
+		return "Drone-O"
+	default:
+		return cleanDroneName(droneID)
 	}
 }
 
-// clearScreen executa sua responsabilidade no fluxo distribuido de forma deterministica e confiavel.
 func clearScreen() {
 	fmt.Print("\033[H\033[2J\033[3J")
 }
 
-// clearMenuLines executa sua responsabilidade no fluxo distribuido de forma deterministica e confiavel.
 func clearMenuLines(linhas int) {
-	// Nova função mágica: sobe o cursor 'N' linhas e apaga tudo abaixo dele
 	fmt.Printf("\033[%dA\033[J", linhas)
 }
 

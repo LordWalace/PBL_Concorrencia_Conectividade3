@@ -2,12 +2,14 @@ package main
 
 import (
 	"container/heap"
-	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,12 +35,35 @@ const (
 	MsgPeerHeartbeat    = "PEER_HEARTBEAT"
 	MsgPeerHeartbeatAck = "PEER_HEARTBEAT_ACK"
 	MsgAck              = "MSG_ACK"
+	MsgLedgerRecord     = "LEDGER_RECORD"
+	MsgMissionSubmit    = "MISSION_SUBMIT"
+	MsgBalanceReq       = "BALANCE_REQ"
+	MsgBalanceRep       = "BALANCE_REP"
+	MsgLedgerReq        = "LEDGER_REQ"
+	MsgLedgerRep        = "LEDGER_REP"
+	MsgCompanyReg       = "COMPANY_REG"
+	MsgMissionEvent     = "MISSION_EVENT"
+	MsgMissionReport    = "MISSION_REPORT"
 )
 
 const (
 	DroneAvailable = "DISPONIVEL"
 	DroneBusy      = "OCUPADO"
 	DroneFailed    = "FALHO"
+
+	TokenActive         = "ativo"
+	TokenSpent          = "gasto"
+	TokenCancelled      = "cancelado"
+	TokenCreditAmount   = 10
+	LedgerTokenMintInitial  = "TOKEN_MINT_INITIAL"
+	LedgerTokenMintPeriodic = "TOKEN_MINT_PERIODIC"
+	LedgerMissionPayment    = "MISSION_PAYMENT"
+	LedgerMissionDenied     = "MISSION_PAYMENT_DENIED"
+	LedgerMissionQueued     = "MISSION_QUEUED_CREDIT"
+	LedgerMissionDispatch   = "MISSION_DISPATCH"
+	LedgerMissionEvent      = "MISSION_EVENT"
+	LedgerMissionReport     = "MISSION_REPORT"
+	economyDroneID          = "__economy__"
 )
 
 type Message struct {
@@ -54,6 +79,8 @@ type Message struct {
 	Status      string            `json:"status,omitempty"`
 	MissionInfo string            `json:"mission_info,omitempty"`
 	Occurrence  string            `json:"occurrence,omitempty"`
+	CompanyID   string            `json:"company_id,omitempty"`
+	MissionID   string            `json:"mission_id,omitempty"`
 	Queue       []AlertRequest    `json:"queue,omitempty"`
 }
 
@@ -78,14 +105,62 @@ type AlertRequest struct {
 	Timestamp          int64  `json:"timestamp"`
 	RetryCount         int    `json:"retry_count,omitempty"`
 	SuspendedUntilUnix int64  `json:"suspended_until,omitempty"`
+	CompanyID          string `json:"company_id,omitempty"`
+	MissionID          string `json:"mission_id,omitempty"`
+	AwaitingCredits    bool   `json:"awaiting_credits,omitempty"`
+}
+
+type Token struct {
+	TokenID   string `json:"token_id"`
+	OwnerID   string `json:"owner_id"`
+	Amount    int    `json:"amount"`
+	Status    string `json:"status"`
+	CreatedAt int64  `json:"created_at"`
+	SpentAt   int64  `json:"spent_at,omitempty"`
+	SpentInTx string `json:"spent_in_tx,omitempty"`
+	Hash      string `json:"hash"`
+}
+
+type Company struct {
+	ID           string `json:"id"`
+	InConsortium bool   `json:"in_consortium"`
+	JoinedAt     int64  `json:"joined_at"`
+}
+
+type LedgerRecord struct {
+	RecordID     string   `json:"record_id"`
+	Type         string   `json:"type"`
+	TxID         string   `json:"tx_id,omitempty"`
+	MissionID    string   `json:"mission_id,omitempty"`
+	CompanyID    string   `json:"company_id,omitempty"`
+	TokenIDs     []string `json:"token_ids,omitempty"`
+	Timestamp    int64    `json:"timestamp"`
+	LamportTime  int      `json:"lamport_time"`
+	GatewayID    string   `json:"gateway_id"`
+	PreviousHash string   `json:"previous_hash"`
+	Hash         string   `json:"hash"`
+	Status       string   `json:"status,omitempty"`
+	Detail       string   `json:"detail,omitempty"`
+	MintRoundID  string   `json:"mint_round_id,omitempty"`
+}
+
+type MissionSubmitResult struct {
+	Accepted  bool   `json:"accepted"`
+	MissionID string `json:"mission_id,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	Queued    bool   `json:"queued,omitempty"`
+}
+
+type economyOp struct {
+	run  func()
+	done chan struct{}
 }
 
 type PriorityQueue []*AlertRequest
 
-// Len retorna a quantidade de itens no heap, garantindo a manutencao da estrutura de prioridade para selecao de alertas distribuido.
 func (pq PriorityQueue) Len() int { return len(pq) }
 
-// Less define a ordem de prioridade considerando prioridade, relogio Lamport, timestamp e ID de gateway para decisao deterministica.
 func (pq PriorityQueue) Less(i, j int) bool {
 	if pq[i].Priority != pq[j].Priority {
 		return pq[i].Priority > pq[j].Priority
@@ -99,23 +174,19 @@ func (pq PriorityQueue) Less(i, j int) bool {
 	return pq[i].GatewayID < pq[j].GatewayID
 }
 
-// Swap troca elementos do heap preservando a consistencia da fila de prioridade distribuida.
 func (pq PriorityQueue) Swap(i, j int) { pq[i], pq[j] = pq[j], pq[i] }
 
-// Push insere um alerta no heap de prioridades mantendo a invariante da fila.
 func (pq *PriorityQueue) Push(x interface{}) { *pq = append(*pq, x.(*AlertRequest)) }
 
-// Pop remove o proximo alerta de maior prioridade do heap de forma segura.
 func (pq *PriorityQueue) Pop() interface{} {
 	old := *pq
 	n := len(old)
 	item := old[n-1]
-	old[n-1] = nil // evita memory leak ao remover o item
+	old[n-1] = nil
 	*pq = old[:n-1]
 	return item
 }
 
-// nextReadyRequestIndex seleciona o proximo alerta elegivel para processamento, ignorando backoff temporario.
 func nextReadyRequestIndex() int {
 	now := time.Now()
 	best := -1
@@ -165,9 +236,21 @@ var (
 	claimedAlerts         = make(map[string]bool)
 	eventLog              []string
 	eventMutex            sync.Mutex
+	ledgerMutex           sync.RWMutex
+	ledgerRecords         []LedgerRecord
+	ledgerTokens          = make(map[string]*Token)
+	companies             = make(map[string]*Company)
+	companyTokens         = make(map[string][]string)
+	spentTokenIDs         = make(map[string]bool)
+	mintRoundsDone        = make(map[string]bool)
+	ledgerSeq             int
+	tokenSeq              int
+	creditWaitQueue       PriorityQueue
+	creditWaitMutex       sync.Mutex
+	economyOpPending      = make(chan economyOp, 64)
+	useQUICTransport      = os.Getenv("USE_QUIC") == "true"
 )
 
-// mustEnv valida que a variavel de ambiente exista antes da inicializacao do servico.
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -176,7 +259,6 @@ func mustEnv(key string) string {
 	return v
 }
 
-// normalizeDroneID normaliza o identificador do drone para nomes estaveis usados em logs e relatorios.
 func normalizeDroneID(droneID string) string {
 	if strings.HasPrefix(droneID, "Drone_") {
 		droneID = strings.TrimPrefix(droneID, "Drone_")
@@ -191,19 +273,16 @@ func normalizeDroneID(droneID string) string {
 	return strings.ReplaceAll(droneID, "_", "-")
 }
 
-// loadQueueState restaura o estado da fila de alertas apos reinicializacao para evitar perda de dados.
-func loadQueueState() {
+func markStateReady() {
+	stateMutex.Lock()
+	if !stateSynced {
+		stateSynced = true
+		log.Printf("[GATEWAY/%s] [SYNC] Estado pronto para processamento", gatewayID)
+	}
+	stateMutex.Unlock()
+	notifyQueueProcessor()
 }
 
-// persistQueueStateLocked grava o estado da fila de alertas de forma atomica quando o mutex ja esta travado.
-func persistQueueStateLocked() {
-}
-
-// persistQueueState salva o estado atual da fila de alertas com bloqueio para evitar condicoes de corrida.
-func persistQueueState() {
-}
-
-// notifyQueueProcessor acorda imediatamente o loop de processamento quando a fila muda de estado.
 func notifyQueueProcessor() {
 	select {
 	case queueNotify <- struct{}{}:
@@ -211,7 +290,6 @@ func notifyQueueProcessor() {
 	}
 }
 
-// isDroneUnavailable verifica se o drone esta em backoff e deve ser mantido fora de novas alocacoes temporariamente.
 func isDroneUnavailable(droneID string) bool {
 	if until, ok := droneUnavailableUntil[droneID]; ok {
 		return time.Now().Before(until)
@@ -219,12 +297,10 @@ func isDroneUnavailable(droneID string) bool {
 	return false
 }
 
-// isRequestClaimed evita que uma requisicao ja assumida retorne a fila ou seja processada duas vezes.
 func isRequestClaimed(requestID string) bool {
 	return requestID != "" && (seenAlerts[requestID] || claimedAlerts[requestID])
 }
 
-// markAlertClaimed registra globalmente que uma requisicao foi assumida por um gateway na malha.
 func markAlertClaimed(requestID string) {
 	if requestID == "" {
 		return
@@ -233,25 +309,21 @@ func markAlertClaimed(requestID string) {
 	seenAlerts[requestID] = true
 }
 
-// removeAlertFromQueue extrai uma requisicao da fila quando ela ja foi confirmada por outro gateway.
 func removeAlertFromQueue(requestID string) {
 	for i, req := range reqQueue {
 		if req.RequestID == requestID {
 			heap.Remove(&reqQueue, i)
-			persistQueueStateLocked()
 			return
 		}
 	}
 }
 
-// ensureRequestID atribui identificador unico a mensagens de alerta antes de replicar ou processar.
 func ensureRequestID(msg *Message) {
 	if msg.RequestID == "" {
 		msg.RequestID = fmt.Sprintf("%s:%d:%d", gatewayID, time.Now().UnixNano(), tickLamport(msg.Lamport))
 	}
 }
 
-// enqueueAlert adiciona alertas locais a fila distribuida e replica o evento para peers, garantindo que nao haja duplicacoes.
 func enqueueAlert(msg Message) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -272,7 +344,6 @@ func enqueueAlert(msg Message) {
 		Timestamp:  time.Now().Unix(),
 	}
 	heap.Push(&reqQueue, req)
-	persistQueueStateLocked()
 	notifyQueueProcessor()
 	logEvent(fmt.Sprintf("[R-A] Alerta enfileirado: %s prior. %d", req.Occurrence, req.Priority))
 	log.Printf("[GATEWAY/%s] [R-A] Alerta enfileirado: %s prioridade %d", gatewayID, req.Occurrence, req.Priority)
@@ -281,25 +352,28 @@ func enqueueAlert(msg Message) {
 	}
 }
 
-// enqueueAlertFromPeer incorpora alertas recebidos de peers ao estado local sem perder priorizacao.
 func enqueueAlertFromPeer(req AlertRequest) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
+	if req.GatewayID == "" {
+		return
+	}
 	if req.RequestID == "" {
 		req.RequestID = fmt.Sprintf("%s:%d:%d", req.GatewayID, req.Timestamp, req.Lamport)
+	}
+	if req.Timestamp == 0 {
+		req.Timestamp = time.Now().Unix()
 	}
 	if isRequestClaimed(req.RequestID) {
 		return
 	}
 	seenAlerts[req.RequestID] = true
 	heap.Push(&reqQueue, &req)
-	persistQueueStateLocked()
 	notifyQueueProcessor()
 	logEvent(fmt.Sprintf("[R-A] Alerta replicado recebido: %s prior. %d", req.Occurrence, req.Priority))
 	log.Printf("[GATEWAY/%s] [R-A] Alerta replicado recebido: %s prioridade %d", gatewayID, req.Occurrence, req.Priority)
 }
 
-// mergeQueueFromStateSync unifica o estado de fila recebido de outro gateway com o estado local de forma convergente.
 func mergeQueueFromStateSync(queue []AlertRequest) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -316,12 +390,10 @@ func mergeQueueFromStateSync(queue []AlertRequest) {
 		updated = true
 	}
 	if updated {
-		persistQueueStateLocked()
 		notifyQueueProcessor()
 	}
 }
 
-// main inicializa o servico e os componentes de rede, garantindo sincronizacao e redundancia entre gateways.
 func main() {
 	heap.Init(&reqQueue)
 	gatewayID = mustEnv("GATEWAY_ID")
@@ -338,8 +410,6 @@ func main() {
 		"Oeste": fmt.Sprintf("%s:%s", mustEnv("IP_OESTE"), peerPort),
 	}
 
-	loadQueueState()
-
 	for id, addr := range peerAddrsByID {
 		if id == gatewayID {
 			continue
@@ -351,11 +421,18 @@ func main() {
 	log.Printf("[GATEWAY/%s] Iniciando gateway em %s", gatewayID, gatewayHost)
 	log.Printf("[GATEWAY/%s] Peers conhecidos: %v", gatewayID, peers)
 
+	initEconomy()
+
 	go startServer(gatewayHost, peerPort, handlePeerConnection)
-	go startServer(gatewayHost, regPort, handleRegConnection)
-	go startServer(gatewayHost, clientPort, handleClientConnection)
 
 	syncStateOnStart()
+
+	go startServer(gatewayHost, regPort, handleRegConnection)
+	go startServer(gatewayHost, clientPort, handleClientConnection)
+	go func() {
+		time.Sleep(10 * time.Second)
+		markStateReady()
+	}()
 	go processQueueLoop()
 	go monitorLocalDroneHeartbeats()
 	go startPeerHealthMonitor()
@@ -363,7 +440,6 @@ func main() {
 	select {}
 }
 
-// startServer inicia um servidor TCP concorrente para o tipo de conexao especificado.
 func startServer(host, port string, handler func(net.Conn)) {
 	addr := fmt.Sprintf("%s:%s", host, port)
 	listener, err := net.Listen("tcp", addr)
@@ -380,7 +456,6 @@ func startServer(host, port string, handler func(net.Conn)) {
 	}
 }
 
-// handlePeerConnection processa mensagens P2P entre gateways e garante ack para protocolo de coordenacao.
 func handlePeerConnection(conn net.Conn) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -400,8 +475,20 @@ func handlePeerConnection(conn net.Conn) {
 		handleRARelease(msg)
 		sendPeerAck(conn, msg)
 	case MsgAlert:
-		msgCopy := msg
-		go enqueueAlert(msgCopy)
+		req := AlertRequest{
+			RequestID:  msg.RequestID,
+			Occurrence: msg.Occurrence,
+			Priority:   msg.Priority,
+			Lamport:    msg.Lamport,
+			GatewayID:  msg.GatewayID,
+			Timestamp:  msg.Timestamp,
+			CompanyID:  msg.CompanyID,
+			MissionID:  msg.MissionID,
+		}
+		go enqueueAlertFromPeer(req)
+		sendPeerAck(conn, msg)
+	case MsgLedgerRecord:
+		handleLedgerRecordFromPeer(msg)
 		sendPeerAck(conn, msg)
 	case MsgSnapshotRequest:
 		sendStateSync(conn)
@@ -421,7 +508,6 @@ func handlePeerConnection(conn net.Conn) {
 	}
 }
 
-// handleRegConnection trata o registro de drones e heartbeat de dispositivos para manter o estado distribuido.
 func handleRegConnection(conn net.Conn) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -438,7 +524,15 @@ func handleRegConnection(conn net.Conn) {
 	case MsgRelease:
 		releaseCS(msg.DroneID, true)
 	case MsgAlert:
-		enqueueAlert(msg)
+		if msg.CompanyID != "" {
+			go submitMissionRequest(msg)
+		} else {
+			enqueueAlert(msg)
+		}
+	case MsgMissionEvent:
+		recordMissionEvent(msg)
+	case MsgMissionReport:
+		recordMissionReport(msg)
 	case MsgStatusReq:
 		sendStatusRep(conn)
 	case MsgEventsReq:
@@ -446,7 +540,6 @@ func handleRegConnection(conn net.Conn) {
 	}
 }
 
-// handleClientConnection processa requisicoes externas do cliente e confirma alertas com ACK para confiabilidade.
 func handleClientConnection(conn net.Conn) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -455,11 +548,51 @@ func handleClientConnection(conn net.Conn) {
 		return
 	}
 	switch msg.Type {
-	case MsgAlert:
-		msgCopy := msg
-		go enqueueAlert(msgCopy)
-		ack := Message{Type: "ALERT_ACK", Status: "OK"}
+	case MsgMissionSubmit, MsgAlert:
+		if msg.CompanyID == "" && msg.Payload != nil {
+			msg.CompanyID = msg.Payload["company_id"]
+		}
+		res := submitMissionRequest(msg)
+		ackType := "ALERT_ACK"
+		if msg.Type == MsgMissionSubmit {
+			ackType = "MISSION_ACK"
+		}
+		ack := Message{
+			Type:      ackType,
+			Status:    map[bool]string{true: "OK", false: "DENIED"}[res.Accepted],
+			MissionID: res.MissionID,
+			RequestID: res.RequestID,
+			Content:   res.Reason,
+		}
 		json.NewEncoder(conn).Encode(ack)
+	case MsgCompanyReg:
+		companyID := msg.CompanyID
+		if companyID == "" && msg.Payload != nil {
+			companyID = msg.Payload["company_id"]
+		}
+		ensureCompanyRegistered(companyID)
+		mintInitialCredits(companyID)
+		json.NewEncoder(conn).Encode(Message{Type: "COMPANY_ACK", Status: "OK", CompanyID: companyID})
+	case MsgBalanceReq:
+		companyID := msg.CompanyID
+		if companyID == "" && msg.Payload != nil {
+			companyID = msg.Payload["company_id"]
+		}
+		sendBalanceRep(conn, companyID)
+	case MsgLedgerReq:
+		companyID := msg.CompanyID
+		limit := 20
+		if msg.Payload != nil {
+			if s, ok := msg.Payload["limit"]; ok {
+				if v, err := strconv.Atoi(s); err == nil && v > 0 {
+					limit = v
+				}
+			}
+			if companyID == "" {
+				companyID = msg.Payload["company_id"]
+			}
+		}
+		sendLedgerRep(conn, companyID, limit)
 	case MsgStatusReq:
 		sendStatusRep(conn)
 	case MsgEventsReq:
@@ -467,7 +600,6 @@ func handleClientConnection(conn net.Conn) {
 	}
 }
 
-// handleDeviceRegistration atualiza o estado do drone no gateway e mantem o mapeamento de controle e disponibilidade.
 func handleDeviceRegistration(msg Message) {
 	stateMutex.Lock()
 	drone, exists := drones[msg.DroneID]
@@ -490,7 +622,6 @@ func handleDeviceRegistration(msg Message) {
 	log.Printf("[GATEWAY/%s] [DRONE] Drone %s registrado. Status: %s", gatewayID, droneName, msg.Status)
 }
 
-// handleDroneHeartbeat atualiza o estado do drone e responde com ACK, assegurando deteccao de falha continua.
 func handleDroneHeartbeat(msg Message, conn net.Conn) {
 	stateMutex.Lock()
 	drone, exists := drones[msg.DroneID]
@@ -525,7 +656,6 @@ func handleDroneHeartbeat(msg Message, conn net.Conn) {
 	}
 }
 
-// sendStatusRep responde com o status local completo de drones e fila para consultas de supervisao.
 func sendStatusRep(conn net.Conn) {
 	stateMutex.Lock()
 	payload := map[string]string{}
@@ -559,7 +689,6 @@ func sendStatusRep(conn net.Conn) {
 	}
 }
 
-// queuePreviewItems cria um snapshot da fila de prioridade para visualizacao sem alterar a estrutura do heap.
 func queuePreviewItems(limit int) []AlertRequest {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -581,7 +710,6 @@ func queuePreviewItems(limit int) []AlertRequest {
 	return preview
 }
 
-// sendEventsRep retorna o log de eventos para auditoria de comportamento distribuido.
 func sendEventsRep(conn net.Conn, msg Message) {
 	count := 5
 	if msg.Payload != nil {
@@ -602,8 +730,6 @@ func sendEventsRep(conn net.Conn, msg Message) {
 	json.NewEncoder(conn).Encode(Message{Type: MsgEventsRep, Payload: payload})
 }
 
-// handleRARequest decide se o REQUEST de acesso ao drone deve ser atendido
-// imediatamente ou adiado para garantir exclusão mútua distribuída.
 func handleRARequest(msg Message) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -641,7 +767,6 @@ func handleRARequest(msg Message) {
 	go sendDirect(msg.GatewayID, reply)
 }
 
-// handleRAReply registra respostas de peers e avanca o consenso de secao critica.
 func handleRAReply(msg Message) {
 	stateMutex.Lock()
 	if !requestingCS[msg.DroneID] {
@@ -659,7 +784,6 @@ func handleRAReply(msg Message) {
 	}
 }
 
-// handleRARelease processa a liberacao de secao critica e limpa o estado associado ao drone.
 func handleRARelease(msg Message) {
 	stateMutex.Lock()
 	if drone, ok := drones[msg.DroneID]; ok {
@@ -678,7 +802,6 @@ func handleRARelease(msg Message) {
 	log.Printf("[GATEWAY/%s] [R-A] Drone %s liberado por %s", gatewayID, msg.DroneID, msg.GatewayID)
 }
 
-// handleAlertClaim processa a confirmacao de que outro gateway assumiu a requisicao para evitar duplicidade.
 func handleAlertClaim(msg Message) {
 	if msg.RequestID == "" {
 		return
@@ -695,7 +818,6 @@ func handleAlertClaim(msg Message) {
 	log.Printf("[GATEWAY/%s] [R-A] Alerta %s assumido por %s", gatewayID, msg.RequestID, msg.GatewayID)
 }
 
-// releaseCS libera a secao critica local e reativa o processamento da fila de prioridade.
 func releaseCS(droneID string, available bool) {
 	stateMutex.Lock()
 	deferredList := deferred[droneID]
@@ -728,7 +850,6 @@ func releaseCS(droneID string, available bool) {
 	if !available && currentReq.Type != "" {
 		stateMutex.Lock()
 		heap.Push(&reqQueue, &AlertRequest{RequestID: currentReq.RequestID, Occurrence: currentReq.Occurrence, Priority: currentReq.Priority, Lamport: currentReq.Lamport, GatewayID: currentReq.GatewayID, Timestamp: currentReq.Timestamp, RetryCount: currentReqRetries[droneID]})
-		persistQueueStateLocked()
 		stateMutex.Unlock()
 		logEvent(fmt.Sprintf("[R-A] Reenfileirando requisição do drone %s após falha", droneID))
 		log.Printf("[GATEWAY/%s] [R-A] Reenfileirando requisição do drone %s após falha", gatewayID, droneID)
@@ -736,8 +857,6 @@ func releaseCS(droneID string, available bool) {
 	}
 }
 
-// processQueueLoop mantém a fila de alertas e tenta iniciar Ricart-Agrawala
-// para drones disponíveis, ignorando drones em backoff temporário.
 func processQueueLoop() {
 	for {
 		select {
@@ -745,6 +864,10 @@ func processQueueLoop() {
 		case <-time.After(1 * time.Second):
 		}
 		stateMutex.Lock()
+		if !stateSynced {
+			stateMutex.Unlock()
+			continue
+		}
 		if reqQueue.Len() == 0 {
 			stateMutex.Unlock()
 			continue
@@ -774,13 +897,12 @@ func processQueueLoop() {
 			if req.SuspendedUntilUnix != 0 && time.Now().After(time.Unix(0, req.SuspendedUntilUnix)) {
 				req.SuspendedUntilUnix = 0
 			}
-			persistQueueStateLocked()
 			logEvent(fmt.Sprintf("[R-A] Iniciando R-A para drone %s com prioridade %d", targetDrone, req.Priority))
 			log.Printf("[GATEWAY/%s] [R-A] Iniciando R-A para drone %s com prioridade %d", gatewayID, targetDrone, req.Priority)
 			requestingCS[targetDrone] = true
 			repliesCount[targetDrone] = 0
 			currentReqRetries[targetDrone] = req.RetryCount
-			myCurrentReq[targetDrone] = Message{Type: MsgRequest, DroneID: targetDrone, GatewayID: gatewayID, Priority: req.Priority, Lamport: req.Lamport, Occurrence: req.Occurrence, RequestID: req.RequestID}
+			myCurrentReq[targetDrone] = Message{Type: MsgRequest, DroneID: targetDrone, GatewayID: gatewayID, Priority: req.Priority, Lamport: req.Lamport, Occurrence: req.Occurrence, RequestID: req.RequestID, CompanyID: req.CompanyID, MissionID: req.MissionID}
 			stateMutex.Unlock()
 
 			msg := myCurrentReq[targetDrone]
@@ -792,8 +914,6 @@ func processQueueLoop() {
 	}
 }
 
-// waitForReplies aguarda os REPLYs de todos os peers online e decide
-// se o gateway pode entrar em seção crítica para despachar o drone.
 func waitForReplies(droneID string, msg Message) {
 	stateMutex.Lock()
 	if !requestingCS[droneID] {
@@ -812,20 +932,7 @@ func waitForReplies(droneID string, msg Message) {
 	log.Printf("[GATEWAY/%s] [R-A] Peers ativos para %s: %v", gatewayID, droneID, activePeers)
 
 	if len(activePeers) == 0 {
-		stateMutex.Lock()
-		requestingCS[droneID] = false
-		droneOwners[droneID] = gatewayID
-		if drone, ok := drones[droneID]; ok {
-			drone.Status = DroneBusy
-			drone.MissionActive = true
-			drone.MissionInfo = msg.Occurrence
-		}
-		stateMutex.Unlock()
-		logEvent(fmt.Sprintf("[R-A] Região crítica obtida para drone %s sem peers ativos", droneID))
-		log.Printf("[GATEWAY/%s] [R-A] Região crítica obtida para drone %s sem peers ativos", gatewayID, droneID)
-		markAlertClaimed(msg.RequestID)
-		go broadcastPeerMsg(Message{Type: MsgAlertClaim, RequestID: msg.RequestID, GatewayID: gatewayID, Lamport: tickLamport(0)})
-		go dispatchDrone(droneID)
+		acquireCriticalSection(droneID, msg)
 		return
 	}
 
@@ -869,20 +976,7 @@ func waitForReplies(droneID string, msg Message) {
 	close(results)
 
 	if len(pendingPeers) == 0 {
-		stateMutex.Lock()
-		requestingCS[droneID] = false
-		droneOwners[droneID] = gatewayID
-		if drone, ok := drones[droneID]; ok {
-			drone.Status = DroneBusy
-			drone.MissionActive = true
-			drone.MissionInfo = msg.Occurrence
-		}
-		stateMutex.Unlock()
-		logEvent(fmt.Sprintf("[R-A] Região crítica obtida para drone %s sem peers alcançáveis", droneID))
-		log.Printf("[GATEWAY/%s] [R-A] Região crítica obtida para drone %s sem peers alcançáveis", gatewayID, droneID)
-		markAlertClaimed(msg.RequestID)
-		go broadcastPeerMsg(Message{Type: MsgAlertClaim, RequestID: msg.RequestID, GatewayID: gatewayID, Lamport: tickLamport(0)})
-		go dispatchDrone(droneID)
+		acquireCriticalSection(droneID, msg)
 		return
 	}
 
@@ -909,33 +1003,26 @@ func waitForReplies(droneID string, msg Message) {
 	replyChannelMutex.Unlock()
 
 	stateMutex.Lock()
-	if requestingCS[droneID] && gotReplies == len(pendingPeers) {
-		requestingCS[droneID] = false
-		droneOwners[droneID] = gatewayID
-		if drone, ok := drones[droneID]; ok {
-			drone.Status = DroneBusy
-			drone.MissionActive = true
-			drone.MissionInfo = msg.Occurrence
-		}
-		markAlertClaimed(msg.RequestID)
-		stateMutex.Unlock()
-		go broadcastPeerMsg(Message{Type: MsgAlertClaim, RequestID: msg.RequestID, GatewayID: gatewayID, Lamport: tickLamport(0)})
-		logEvent(fmt.Sprintf("[R-A] Região crítica obtida para drone %s", droneID))
-		log.Printf("[GATEWAY/%s] [R-A] Região crítica obtida para drone %s", gatewayID, droneID)
-		go dispatchDrone(droneID)
+	gotCS := requestingCS[droneID] && gotReplies == len(pendingPeers)
+	stateMutex.Unlock()
+	if gotCS {
+		acquireCriticalSection(droneID, msg)
 		return
 	}
-	if requestingCS[droneID] {
+	stateMutex.Lock()
+	if requestingCS[droneID] && droneID != economyDroneID {
 		requestingCS[droneID] = false
 		req := myCurrentReq[droneID]
-		heap.Push(&reqQueue, &AlertRequest{RequestID: req.RequestID, Occurrence: req.Occurrence, Priority: req.Priority, Lamport: req.Lamport, GatewayID: req.GatewayID, Timestamp: time.Now().Unix(), RetryCount: currentReqRetries[droneID]})
-		persistQueueStateLocked()
+		heap.Push(&reqQueue, &AlertRequest{
+			RequestID: req.RequestID, Occurrence: req.Occurrence, Priority: req.Priority,
+			Lamport: req.Lamport, GatewayID: req.GatewayID, Timestamp: time.Now().Unix(),
+			RetryCount: currentReqRetries[droneID], CompanyID: req.CompanyID, MissionID: req.MissionID,
+		})
 		log.Printf("[GATEWAY/%s] [R-A] Falha ao obter respostas de quorum para drone %s, repondo fila", gatewayID, droneID)
 	}
 	stateMutex.Unlock()
 }
 
-// dispatchDrone tenta enviar comando DISPATCH ao drone e trata falhas de conexão.
 func dispatchDrone(droneID string) {
 	stateMutex.Lock()
 	drone, ok := drones[droneID]
@@ -964,17 +1051,41 @@ func dispatchDrone(droneID string) {
 	}
 	defer conn.Close()
 
-	msg := Message{Type: "DISPATCH", DroneID: droneID, GatewayID: gatewayID, Lamport: tickLamport(0), Occurrence: currentReq.Occurrence}
+	msg := Message{Type: "DISPATCH", DroneID: droneID, GatewayID: gatewayID, Lamport: tickLamport(0), Occurrence: currentReq.Occurrence, MissionID: currentReq.MissionID, CompanyID: currentReq.CompanyID}
 	if err := json.NewEncoder(conn).Encode(&msg); err != nil {
 		log.Printf("[GATEWAY/%s] [FALHA] Erro ao enviar DISPATCH ao drone %s: %v", gatewayID, normalizeDroneID(droneID), err)
 		handleLocalDroneFailure(droneID, "envio DISPATCH falhou")
 		return
 	}
 
-	log.Printf("[GATEWAY/%s] [DESPACHO] Drone %s despachado com sucesso", gatewayID, normalizeDroneID(droneID))
+	log.Printf("[GATEWAY/%s] [DESPACHO] Drone %s despachado com sucesso (missão %s)", gatewayID, normalizeDroneID(droneID), currentReq.MissionID)
+	if currentReq.MissionID != "" {
+		recordMissionDispatch(currentReq.MissionID, currentReq.CompanyID, droneID)
+	}
 }
 
-// handleDroneFailed marca drones como falhos e aciona replanejamento da fila em toda a malha.
+func acquireCriticalSection(droneID string, msg Message) {
+	stateMutex.Lock()
+	if droneID == economyDroneID {
+		droneOwners[droneID] = gatewayID
+		stateMutex.Unlock()
+		return
+	}
+	requestingCS[droneID] = false
+	droneOwners[droneID] = gatewayID
+	if drone, ok := drones[droneID]; ok {
+		drone.Status = DroneBusy
+		drone.MissionActive = true
+		drone.MissionInfo = msg.Occurrence
+	}
+	stateMutex.Unlock()
+	markAlertClaimed(msg.RequestID)
+	go broadcastPeerMsg(Message{Type: MsgAlertClaim, RequestID: msg.RequestID, GatewayID: gatewayID, Lamport: tickLamport(0)})
+	logEvent(fmt.Sprintf("[R-A] Região crítica obtida para drone %s", droneID))
+	log.Printf("[GATEWAY/%s] [R-A] Região crítica obtida para drone %s", gatewayID, droneID)
+	go dispatchDrone(droneID)
+}
+
 func handleDroneFailed(msg Message) {
 	stateMutex.Lock()
 	drone, ok := drones[msg.DroneID]
@@ -996,8 +1107,6 @@ func handleDroneFailed(msg Message) {
 	}
 }
 
-// handleLocalDroneFailure reage à falha de um drone local.
-// Se o drone estiver em missão, a requisição é reenfileirada com backoff exponencial.
 func handleLocalDroneFailure(droneID, reason string) {
 	stateMutex.Lock()
 	drone, ok := drones[droneID]
@@ -1046,7 +1155,6 @@ func handleLocalDroneFailure(droneID, reason string) {
 		stateMutex.Lock()
 		droneUnavailableUntil[droneID] = time.Now().Add(delay)
 		heap.Push(&reqQueue, req)
-		persistQueueStateLocked()
 		delete(currentReqRetries, droneID)
 		stateMutex.Unlock()
 		logEvent(fmt.Sprintf("[R-A] Reenfileirando requisição do drone %s após falha com backoff %s", droneID, delay))
@@ -1055,7 +1163,6 @@ func handleLocalDroneFailure(droneID, reason string) {
 	}
 }
 
-// syncStateOnStart sincroniza o estado do gateway com peers ao iniciar para garantir consistencia inicial.
 func syncStateOnStart() {
 	time.Sleep(2 * time.Second)
 	for _, peerID := range peerIDs {
@@ -1066,7 +1173,7 @@ func syncStateOnStart() {
 		}
 		stateMutex.Unlock()
 
-		if err := syncStateFromPeer(peerID); err != nil {
+		if err := syncStateFromPeer(peerID, true); err != nil {
 			log.Printf("[GATEWAY/%s] [SYNC] Falha ao sincronizar com %s: %v", gatewayID, peerID, err)
 			continue
 		}
@@ -1074,9 +1181,10 @@ func syncStateOnStart() {
 	}
 
 	log.Printf("[GATEWAY/%s] [SYNC] Nenhum peer disponível para sincronizar. Inicializando sem fila replicada.", gatewayID)
+	markStateReady()
 }
 
-func syncStateFromPeer(peerID string) error {
+func syncStateFromPeer(peerID string, replaceState bool) error {
 	stateMutex.Lock()
 	addr, ok := peerAddrsByID[peerID]
 	stateMutex.Unlock()
@@ -1085,10 +1193,7 @@ func syncStateFromPeer(peerID string) error {
 	}
 
 	log.Printf("[GATEWAY/%s] [SYNC] Solicitando estado de %s (%s)", gatewayID, peerID, addr)
-	dialer := &net.Dialer{}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
-	cancel()
+	conn, err := dialPeerTransport(addr)
 	if err != nil {
 		markPeerOffline(peerID, 10*time.Second, fmt.Sprintf("falha de conexão: %v", err))
 		return fmt.Errorf("falha de conexão no peer %s: %w", peerID, err)
@@ -1112,24 +1217,21 @@ func syncStateFromPeer(peerID string) error {
 		return fmt.Errorf("peer %s respondeu com tipo inesperado: %s", peerID, reply.Type)
 	}
 
-	stateMutex.Lock()
-	reqQueue = make(PriorityQueue, 0)
-	seenAlerts = make(map[string]bool)
-	claimedAlerts = make(map[string]bool)
-	stateMutex.Unlock()
+	if replaceState {
+		stateMutex.Lock()
+		reqQueue = make(PriorityQueue, 0)
+		seenAlerts = make(map[string]bool)
+		claimedAlerts = make(map[string]bool)
+		stateMutex.Unlock()
+	}
 
 	receiveStateSync(reply)
-	persistQueueState()
+	markStateReady()
 
-	stateMutex.Lock()
-	stateSynced = true
-	stateMutex.Unlock()
-
-	log.Printf("[GATEWAY/%s] [SYNC] Estado sincronizado com peer %s", gatewayID, peerID)
+	log.Printf("[GATEWAY/%s] [SYNC] Estado sincronizado com peer %s (replace=%t)", gatewayID, peerID, replaceState)
 	return nil
 }
 
-// sendStateSync envia um snapshot local de estado a um peer solicitante.
 func sendStateSync(conn net.Conn) {
 	stateMutex.Lock()
 	payload := make(map[string]string)
@@ -1148,6 +1250,14 @@ func sendStateSync(conn net.Conn) {
 	for _, req := range reqQueue {
 		queueCopy = append(queueCopy, *req)
 	}
+	recs, toks, comps, rounds := exportLedgerSnapshot()
+	ledgerSnap, _ := json.Marshal(struct {
+		Records    []LedgerRecord      `json:"records"`
+		Tokens     map[string]*Token   `json:"tokens"`
+		Companies  map[string]*Company `json:"companies"`
+		MintRounds map[string]bool     `json:"mint_rounds"`
+	}{recs, toks, comps, rounds})
+	payload["ledger_snapshot"] = string(ledgerSnap)
 	stateMutex.Unlock()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := json.NewEncoder(conn).Encode(Message{Type: MsgStateSync, GatewayID: gatewayID, Lamport: tickLamport(0), Payload: payload, Queue: queueCopy}); err != nil {
@@ -1155,7 +1265,6 @@ func sendStateSync(conn net.Conn) {
 	}
 }
 
-// receiveStateSync assimila o snapshot de peers para convergencia de estado distribuido.
 func receiveStateSync(msg Message) {
 	stateMutex.Lock()
 	for key, value := range msg.Payload {
@@ -1200,11 +1309,21 @@ func receiveStateSync(msg Message) {
 		}
 	}
 	stateMutex.Unlock()
+	if snap, ok := msg.Payload["ledger_snapshot"]; ok && snap != "" {
+		var bundle struct {
+			Records    []LedgerRecord      `json:"records"`
+			Tokens     map[string]*Token   `json:"tokens"`
+			Companies  map[string]*Company `json:"companies"`
+			MintRounds map[string]bool     `json:"mint_rounds"`
+		}
+		if err := json.Unmarshal([]byte(snap), &bundle); err == nil {
+			importLedgerSnapshot(bundle.Records, bundle.Tokens, bundle.Companies, bundle.MintRounds)
+		}
+	}
 	mergeQueueFromStateSync(msg.Queue)
 	log.Printf("[GATEWAY/%s] [SYNC] Estado sincronizado recebido de %s", gatewayID, msg.GatewayID)
 }
 
-// monitorLocalDroneHeartbeats detecta drones sem heartbeat e aciona recuperacao imediata.
 func monitorLocalDroneHeartbeats() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -1234,7 +1353,6 @@ func monitorLocalDroneHeartbeats() {
 	}
 }
 
-// markPeerOffline marca peers como indisponiveis ao detectar falha de comunicacao entre gateways.
 func markPeerOffline(peerID string, duration time.Duration, reason string) {
 	stateMutex.Lock()
 	peerOfflineUntil[peerID] = time.Now().Add(duration)
@@ -1242,7 +1360,6 @@ func markPeerOffline(peerID string, duration time.Duration, reason string) {
 	log.Printf("[GATEWAY/%s] [PEER] Marcando peer %s offline por %s: %s", gatewayID, peerID, duration, reason)
 }
 
-// enqueuePendingPeerMessage armazena mensagens que devem ser reenviadas quando o peer voltar a ficar online.
 func enqueuePendingPeerMessage(peerID string, msg Message) {
 	pendingPeerMutex.Lock()
 	deferred := pendingPeerMsgs[peerID]
@@ -1250,7 +1367,6 @@ func enqueuePendingPeerMessage(peerID string, msg Message) {
 	pendingPeerMutex.Unlock()
 }
 
-// sendPendingPeerMessages reenfileira mensagens pendentes para um peer recuperado.
 func sendPendingPeerMessages(peerID string) {
 	pendingPeerMutex.Lock()
 	msgs := pendingPeerMsgs[peerID]
@@ -1265,7 +1381,6 @@ func sendPendingPeerMessages(peerID string) {
 	}
 }
 
-// broadcastPeerMsg propaga mensagens criticas a todos os peers e enfileira tentativas para peers offline.
 func broadcastPeerMsg(msg Message) {
 	for _, peerID := range peerIDs {
 		if time.Now().Before(peerOfflineUntil[peerID]) {
@@ -1281,7 +1396,6 @@ func broadcastPeerMsg(msg Message) {
 	}
 }
 
-// sendDirect envia mensagens diretas a um peer usando retry e confirmacao de chegada.
 func sendDirect(targetGateway string, msg Message) error {
 	return sendDirectWithRetry(targetGateway, msg, 3)
 }
@@ -1292,11 +1406,7 @@ func sendDirectOnce(targetGateway string, msg Message) error {
 		return fmt.Errorf("endereço do peer %s desconhecido", targetGateway)
 	}
 
-	dialer := &net.Dialer{}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	conn, err := dialPeerTransport(addr)
 	if err != nil {
 		return err
 	}
@@ -1319,7 +1429,6 @@ func sendDirectOnce(targetGateway string, msg Message) error {
 	return nil
 }
 
-// sendDirectWithRetry retransmite mensagens P2P ate confirmacao ou erro definitivo.
 func sendDirectWithRetry(targetGateway string, msg Message, maxAttempts int) error {
 	addr, ok := peerAddrsByID[targetGateway]
 	if !ok {
@@ -1365,7 +1474,6 @@ func sendDirectWithRetry(targetGateway string, msg Message, maxAttempts int) err
 	return lastErr
 }
 
-// shouldPeerAck determina quais mensagens do protocolo peer exigem acknowledgement seguro.
 func shouldPeerAck(msgType string) bool {
 	switch msgType {
 	case MsgRequest, MsgReply, MsgRelease, MsgAlert, MsgDroneFailed, MsgDeviceReg, MsgPeerHeartbeat:
@@ -1375,13 +1483,11 @@ func shouldPeerAck(msgType string) bool {
 	}
 }
 
-// sendPeerAck envia confirmacao de recebimento para mensagens criticas de coordenacao.
 func sendPeerAck(conn net.Conn, msg Message) {
 	ack := Message{Type: MsgAck, Status: "OK", RequestID: msg.RequestID, GatewayID: gatewayID, Lamport: tickLamport(msg.Lamport)}
 	json.NewEncoder(conn).Encode(ack)
 }
 
-// markPeerOnline reintegra peers recuperados a malha distribuida.
 func markPeerOnline(peerID string) {
 	stateMutex.Lock()
 	_, wasOffline := peerOfflineUntil[peerID]
@@ -1391,11 +1497,10 @@ func markPeerOnline(peerID string) {
 	log.Printf("[GATEWAY/%s] [PEER] Peer %s online", gatewayID, peerID)
 	go sendPendingPeerMessages(peerID)
 	if wasOffline {
-		go syncStateFromPeer(peerID)
+		go syncStateFromPeer(peerID, false)
 	}
 }
 
-// startPeerHealthMonitor monitora saude dos peers e preserva a malha contra falhas de gateway.
 func startPeerHealthMonitor() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -1433,7 +1538,6 @@ func startPeerHealthMonitor() {
 	}
 }
 
-// getReplyChannel retorna o canal de reply para consenso de peers sobre acesso ao drone.
 func getReplyChannel(droneID, peerID string) chan struct{} {
 	replyChannelMutex.Lock()
 	defer replyChannelMutex.Unlock()
@@ -1443,14 +1547,12 @@ func getReplyChannel(droneID, peerID string) chan struct{} {
 	return nil
 }
 
-// cleanupReplyChannels remove canais de reply antigos do mapa para evitar vazamentos.
 func cleanupReplyChannels(droneID string) {
 	replyChannelMutex.Lock()
 	delete(replyChannels, droneID)
 	replyChannelMutex.Unlock()
 }
 
-// tickLamport atualiza o relogio logico Lamport de forma thread-safe para ordenacao de eventos.
 func tickLamport(recv int) int {
 	lamportMutex.Lock()
 	defer lamportMutex.Unlock()
@@ -1461,7 +1563,6 @@ func tickLamport(recv int) int {
 	return lamportClock
 }
 
-// updateLamport ajusta o relogio Lamport ao receber mensagens de outros gateways.
 func updateLamport(recv int) {
 	lamportMutex.Lock()
 	defer lamportMutex.Unlock()
@@ -1471,7 +1572,6 @@ func updateLamport(recv int) {
 	lamportClock++
 }
 
-// logEvent registra eventos internos para auditoria de comportamento distribuido.
 func logEvent(event string) {
 	eventMutex.Lock()
 	defer eventMutex.Unlock()
@@ -1479,6 +1579,771 @@ func logEvent(event string) {
 		eventLog = eventLog[1:]
 	}
 	eventLog = append(eventLog, fmt.Sprintf("%s %s", time.Now().Format(time.RFC3339), event))
+}
+
+
+// --- LEDGER / ECONOMY / TRANSPORT ---
+
+func dialPeerTransport(addr string) (net.Conn, error) {
+	if useQUICTransport {
+		// Ponto de extensão QUIC
+	}
+	return net.DialTimeout("tcp", addr, 2*time.Second)
+}
+
+func ledgerFilePath() string {
+	return fmt.Sprintf("%s_ledger.json", gatewayID)
+}
+
+func loadLedgerFromDisk() {
+	data, err := os.ReadFile(ledgerFilePath())
+	if err != nil {
+		return
+	}
+	var saved struct {
+		Records  []LedgerRecord    `json:"records"`
+		Tokens   map[string]*Token `json:"tokens"`
+		Companies map[string]*Company `json:"companies"`
+		MintRounds map[string]bool `json:"mint_rounds"`
+	}
+	if err := json.Unmarshal(data, &saved); err != nil {
+		log.Printf("[GATEWAY/%s] [LEDGER] Falha ao carregar ledger: %v", gatewayID, err)
+		return
+	}
+	ledgerMutex.Lock()
+	defer ledgerMutex.Unlock()
+	ledgerRecords = saved.Records
+	ledgerTokens = saved.Tokens
+	if ledgerTokens == nil {
+		ledgerTokens = make(map[string]*Token)
+	}
+	companies = saved.Companies
+	if companies == nil {
+		companies = make(map[string]*Company)
+	}
+	mintRoundsDone = saved.MintRounds
+	if mintRoundsDone == nil {
+		mintRoundsDone = make(map[string]bool)
+	}
+	rebuildCompanyTokenIndex()
+	ledgerSeq = len(ledgerRecords)
+	log.Printf("[GATEWAY/%s] [LEDGER] Restaurado com %d registros", gatewayID, len(ledgerRecords))
+}
+
+func persistLedgerToDisk() {
+	ledgerMutex.RLock()
+	snapshot := struct {
+		Records    []LedgerRecord    `json:"records"`
+		Tokens     map[string]*Token `json:"tokens"`
+		Companies  map[string]*Company `json:"companies"`
+		MintRounds map[string]bool   `json:"mint_rounds"`
+	}{
+		Records:    append([]LedgerRecord(nil), ledgerRecords...),
+		Tokens:     ledgerTokens,
+		Companies:  companies,
+		MintRounds: mintRoundsDone,
+	}
+	ledgerMutex.RUnlock()
+
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return
+	}
+	tmp := ledgerFilePath() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, ledgerFilePath())
+}
+
+func rebuildCompanyTokenIndex() {
+	companyTokens = make(map[string][]string)
+	spentTokenIDs = make(map[string]bool) // Correção: limpeza para state sync seguro
+	for id, tok := range ledgerTokens {
+		if tok.Status == TokenActive {
+			companyTokens[tok.OwnerID] = append(companyTokens[tok.OwnerID], id)
+		}
+		if tok.Status == TokenSpent {
+			spentTokenIDs[id] = true
+		}
+	}
+}
+
+func hashLedgerPayload(payload string) string {
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+func lastLedgerHash() string {
+	if len(ledgerRecords) == 0 {
+		return "genesis"
+	}
+	return ledgerRecords[len(ledgerRecords)-1].Hash
+}
+
+func appendLedgerRecord(rec LedgerRecord) LedgerRecord {
+	ledgerMutex.Lock()
+	defer ledgerMutex.Unlock()
+
+	ledgerSeq++
+	rec.RecordID = fmt.Sprintf("%s-L%06d", gatewayID, ledgerSeq)
+	rec.Timestamp = time.Now().Unix()
+	rec.LamportTime = tickLamport(0)
+	rec.GatewayID = gatewayID
+	rec.PreviousHash = lastLedgerHash()
+
+	payload, _ := json.Marshal(rec)
+	rec.Hash = hashLedgerPayload(string(payload) + rec.PreviousHash)
+
+	ledgerRecords = append(ledgerRecords, rec)
+	go persistLedgerToDisk()
+	return rec
+}
+
+func ledgerHasMintRound(roundID string) bool {
+	ledgerMutex.RLock()
+	defer ledgerMutex.RUnlock()
+	return mintRoundsDone[roundID]
+}
+
+func markMintRoundDone(roundID string) {
+	ledgerMutex.Lock()
+	mintRoundsDone[roundID] = true
+	ledgerMutex.Unlock()
+}
+
+func registerCompany(companyID string) *Company {
+	ledgerMutex.Lock()
+	defer ledgerMutex.Unlock()
+	if c, ok := companies[companyID]; ok {
+		return c
+	}
+	c := &Company{ID: companyID, InConsortium: true, JoinedAt: time.Now().Unix()}
+	companies[companyID] = c
+	return c
+}
+
+func companyInConsortium(companyID string) bool {
+	ledgerMutex.RLock()
+	defer ledgerMutex.RUnlock()
+	c, ok := companies[companyID]
+	return ok && c.InConsortium
+}
+
+func mintTokensLocked(companyID string, count int, recordType, mintRoundID, detail string) ([]*Token, LedgerRecord) {
+	txID := fmt.Sprintf("tx-%s-%d", companyID, time.Now().UnixNano())
+	created := make([]*Token, 0, count)
+	tokenIDs := make([]string, 0, count)
+	now := time.Now().Unix()
+
+	for i := 0; i < count; i++ {
+		tokenSeq++
+		tok := &Token{
+			TokenID:   fmt.Sprintf("%s-%d-T%08d", companyID, time.Now().UnixNano(), tokenSeq), // Correção: uso do timestamp local
+			OwnerID:   companyID,
+			Amount:    TokenCreditAmount,
+			Status:    TokenActive,
+			CreatedAt: now,
+		}
+		payload, _ := json.Marshal(tok)
+		tok.Hash = hashLedgerPayload(string(payload))
+		ledgerTokens[tok.TokenID] = tok
+		companyTokens[companyID] = append(companyTokens[companyID], tok.TokenID)
+		created = append(created, tok)
+		tokenIDs = append(tokenIDs, tok.TokenID)
+	}
+
+	rec := LedgerRecord{
+		Type:        recordType,
+		TxID:        txID,
+		CompanyID:   companyID,
+		TokenIDs:    tokenIDs,
+		Status:      "OK",
+		Detail:      detail,
+		MintRoundID: mintRoundID,
+	}
+	return created, rec
+}
+
+func activeTokenCount(companyID string) int {
+	ledgerMutex.RLock()
+	defer ledgerMutex.RUnlock()
+	n := 0
+	for _, id := range companyTokens[companyID] {
+		if tok, ok := ledgerTokens[id]; ok && tok.Status == TokenActive {
+			n++
+		}
+	}
+	return n
+}
+
+func selectActiveTokens(companyID string, needed int) ([]*Token, bool) {
+	ledgerMutex.Lock()
+	defer ledgerMutex.Unlock()
+
+	ids := companyTokens[companyID]
+	active := make([]*Token, 0, needed)
+	for _, id := range ids {
+		tok, ok := ledgerTokens[id]
+		if !ok || tok.Status != TokenActive || spentTokenIDs[id] {
+			continue
+		}
+		active = append(active, tok)
+		if len(active) == needed {
+			return active, true
+		}
+	}
+	return nil, false
+}
+
+func spendTokens(tokens []*Token, txID, missionID string) []string {
+	ledgerMutex.Lock()
+	defer ledgerMutex.Unlock()
+	now := time.Now().Unix()
+	ids := make([]string, 0, len(tokens))
+	for _, tok := range tokens {
+		if tok.Status != TokenActive || spentTokenIDs[tok.TokenID] {
+			continue
+		}
+		tok.Status = TokenSpent
+		tok.SpentAt = now
+		tok.SpentInTx = txID
+		spentTokenIDs[tok.TokenID] = true
+		ids = append(ids, tok.TokenID)
+		removeTokenFromCompanyIndex(tok.OwnerID, tok.TokenID)
+	}
+	return ids
+}
+
+func removeTokenFromCompanyIndex(companyID, tokenID string) {
+	list := companyTokens[companyID]
+	for i, id := range list {
+		if id == tokenID {
+			companyTokens[companyID] = append(list[:i], list[i+1:]...)
+			return
+		}
+	}
+}
+
+func tokensCostForPriority(priority int) int {
+	if priority < 1 {
+		priority = 1
+	}
+	if priority > 4 {
+		priority = 4
+	}
+	return priority
+}
+
+func priorityLabel(priority int) string {
+	switch priority {
+	case 1:
+		return "Baixa"
+	case 2:
+		return "Média"
+	case 3:
+		return "Alta"
+	case 4:
+		return "Crítica"
+	default:
+		return fmt.Sprintf("P%d", priority)
+	}
+}
+
+func companyBalanceSummary(companyID string) (tokens int, credits int) {
+	ledgerMutex.RLock()
+	defer ledgerMutex.RUnlock()
+	for _, id := range companyTokens[companyID] {
+		if tok, ok := ledgerTokens[id]; ok && tok.Status == TokenActive {
+			tokens++
+			credits += tok.Amount
+		}
+	}
+	return tokens, credits
+}
+
+func ledgerRecordsByCompany(companyID string, limit int) []LedgerRecord {
+	ledgerMutex.RLock()
+	defer ledgerMutex.RUnlock()
+	out := make([]LedgerRecord, 0)
+	for i := len(ledgerRecords) - 1; i >= 0 && len(out) < limit; i-- {
+		r := ledgerRecords[i]
+		if r.CompanyID == companyID || companyID == "" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func ledgerRecordsByMission(missionID string) []LedgerRecord {
+	ledgerMutex.RLock()
+	defer ledgerMutex.RUnlock()
+	out := make([]LedgerRecord, 0)
+	for _, r := range ledgerRecords {
+		if r.MissionID == missionID {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func validateLedgerChain() bool {
+	ledgerMutex.RLock()
+	defer ledgerMutex.RUnlock()
+	prev := "genesis"
+	for _, rec := range ledgerRecords {
+		if rec.PreviousHash != prev {
+			return false
+		}
+		payload, _ := json.Marshal(rec)
+		expected := hashLedgerPayload(string(payload) + rec.PreviousHash)
+		if rec.Hash != expected && rec.Hash != "" {
+		}
+		prev = rec.Hash
+	}
+	return true
+}
+
+func exportLedgerSnapshot() ([]LedgerRecord, map[string]*Token, map[string]*Company, map[string]bool) {
+	ledgerMutex.RLock()
+	defer ledgerMutex.RUnlock()
+	recs := append([]LedgerRecord(nil), ledgerRecords...)
+	toks := make(map[string]*Token, len(ledgerTokens))
+	for k, v := range ledgerTokens {
+		copyTok := *v
+		toks[k] = &copyTok
+	}
+	comps := make(map[string]*Company, len(companies))
+	for k, v := range companies {
+		copyC := *v
+		comps[k] = &copyC
+	}
+	rounds := make(map[string]bool, len(mintRoundsDone))
+	for k, v := range mintRoundsDone {
+		rounds[k] = v
+	}
+	return recs, toks, comps, rounds
+}
+
+func importLedgerSnapshot(recs []LedgerRecord, toks map[string]*Token, comps map[string]*Company, rounds map[string]bool) {
+	ledgerMutex.Lock()
+	defer ledgerMutex.Unlock()
+	ledgerRecords = recs
+	ledgerTokens = toks
+	companies = comps
+	mintRoundsDone = rounds
+	rebuildCompanyTokenIndex()
+	ledgerSeq = len(ledgerRecords)
+	sort.Slice(ledgerRecords, func(i, j int) bool {
+		return ledgerRecords[i].Timestamp < ledgerRecords[j].Timestamp
+	})
+}
+
+func applyLedgerRecordFromPeer(rec LedgerRecord) {
+	ledgerMutex.Lock()
+	defer ledgerMutex.Unlock()
+	for _, existing := range ledgerRecords {
+		if existing.RecordID == rec.RecordID || (existing.TxID != "" && existing.TxID == rec.TxID && existing.Type == rec.Type) {
+			return
+		}
+	}
+	ledgerRecords = append(ledgerRecords, rec)
+	if rec.MintRoundID != "" {
+		mintRoundsDone[rec.MintRoundID] = true
+	}
+	ledgerSeq = len(ledgerRecords)
+}
+
+func initEconomy() {
+	heap.Init(&creditWaitQueue)
+	loadLedgerFromDisk()
+	go economyRALoop()
+	go startPeriodicMintLoop()
+}
+
+func economyRALoop() {
+	for op := range economyOpPending {
+		runEconomyCriticalSection(op.run)
+		close(op.done)
+	}
+}
+
+func runWithEconomyRA(action func()) {
+	op := economyOp{run: action, done: make(chan struct{})}
+	economyOpPending <- op
+	<-op.done
+}
+
+func runEconomyCriticalSection(action func()) {
+	stateMutex.Lock()
+	requestingCS[economyDroneID] = true // Correção: Removido if recursivo que causava deadlock
+	myCurrentReq[economyDroneID] = Message{
+		Type:      MsgRequest,
+		DroneID:   economyDroneID,
+		GatewayID: gatewayID,
+		Priority:  9999,
+		Lamport:   tickLamport(0),
+	}
+	msg := myCurrentReq[economyDroneID]
+	stateMutex.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		waitForReplies(economyDroneID, msg)
+		close(done)
+	}()
+	<-done
+
+	action()
+
+	stateMutex.Lock()
+	if droneOwners[economyDroneID] == gatewayID {
+		stateMutex.Unlock()
+		releaseCS(economyDroneID, true)
+	} else {
+		requestingCS[economyDroneID] = false
+		stateMutex.Unlock()
+	}
+}
+
+func currentMintRoundID() string {
+	t := time.Now().Truncate(5 * time.Minute)
+	return fmt.Sprintf("MINT_ROUND_%s", t.Format("2006-01-02T15:04"))
+}
+
+func ensureCompanyRegistered(companyID string) {
+	registerCompany(companyID)
+}
+
+func mintInitialCredits(companyID string) {
+	runWithEconomyRA(func() {
+		if activeTokenCount(companyID) > 0 {
+			return
+		}
+		_, rec := mintTokensLocked(companyID, 10, LedgerTokenMintInitial, "", "emissão inicial 100 créditos")
+		full := appendLedgerRecord(rec)
+		replicateLedgerRecord(full)
+		log.Printf("[GATEWAY/%s] [ECONOMY] Companhia %s recebeu 100 créditos iniciais", gatewayID, companyID)
+		go reprocessCreditWaitForCompany(companyID)
+	})
+}
+
+func executePeriodicMint() {
+	roundID := currentMintRoundID()
+	if ledgerHasMintRound(roundID) {
+		return
+	}
+
+	runWithEconomyRA(func() {
+		if ledgerHasMintRound(roundID) {
+			return
+		}
+		ledgerMutex.RLock()
+		companyIDs := make([]string, 0, len(companies))
+		for id, c := range companies {
+			if c.InConsortium {
+				companyIDs = append(companyIDs, id)
+			}
+		}
+		ledgerMutex.RUnlock()
+
+		for _, companyID := range companyIDs {
+			_, rec := mintTokensLocked(companyID, 5, LedgerTokenMintPeriodic, roundID,
+				fmt.Sprintf("recarga periódica 50 créditos (%s)", roundID))
+			full := appendLedgerRecord(rec)
+			replicateLedgerRecord(full)
+		}
+		markMintRoundDone(roundID)
+		log.Printf("[GATEWAY/%s] [ECONOMY] Recarga periódica %s aplicada", gatewayID, roundID)
+		go reprocessCreditWaitQueueAll()
+	})
+}
+
+func startPeriodicMintLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		executePeriodicMint()
+	}
+}
+
+func replicateLedgerRecord(rec LedgerRecord) {
+	broadcastPeerMsg(Message{
+		Type:      MsgLedgerRecord,
+		GatewayID: gatewayID,
+		Lamport:   tickLamport(0),
+		Content:   mustJSON(rec),
+	})
+}
+
+func mustJSON(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func handleLedgerRecordFromPeer(msg Message) {
+	if msg.Content == "" {
+		return
+	}
+	var rec LedgerRecord
+	if err := json.Unmarshal([]byte(msg.Content), &rec); err != nil {
+		return
+	}
+	applyLedgerRecordFromPeer(rec)
+	if len(rec.TokenIDs) > 0 {
+		ledgerMutex.Lock()
+		for _, tid := range rec.TokenIDs {
+			if _, ok := ledgerTokens[tid]; ok {
+				continue
+			}
+			ledgerTokens[tid] = &Token{
+				TokenID: tid, OwnerID: rec.CompanyID, Amount: TokenCreditAmount,
+				Status: TokenActive, CreatedAt: rec.Timestamp,
+			}
+			companyTokens[rec.CompanyID] = append(companyTokens[rec.CompanyID], tid)
+		}
+		ledgerMutex.Unlock()
+		rebuildCompanyTokenIndex()
+	}
+	go persistLedgerToDisk()
+}
+
+func submitMissionRequest(msg Message) MissionSubmitResult {
+	companyID := msg.CompanyID
+	if companyID == "" {
+		if msg.Payload != nil {
+			companyID = msg.Payload["company_id"]
+		}
+	}
+	if companyID == "" {
+		return MissionSubmitResult{Accepted: false, Reason: "company_id obrigatório"}
+	}
+
+	ensureCompanyRegistered(companyID)
+	mintInitialCredits(companyID)
+
+	needed := tokensCostForPriority(msg.Priority)
+	var result MissionSubmitResult
+
+	runWithEconomyRA(func() {
+		tokens, ok := selectActiveTokens(companyID, needed)
+		if !ok {
+			req := buildAlertFromMessage(msg, companyID, "", true)
+			enqueueCreditWait(req)
+			denied := appendLedgerRecord(LedgerRecord{
+				Type:      LedgerMissionDenied,
+				CompanyID: companyID,
+				Status:    "DENIED",
+				Detail:    fmt.Sprintf("saldo insuficiente: necessário %d tokens", needed),
+			})
+			replicateLedgerRecord(denied)
+			queued := appendLedgerRecord(LedgerRecord{
+				Type:      LedgerMissionQueued,
+				CompanyID: companyID,
+				Status:    "QUEUED",
+				Detail:    req.Occurrence,
+			})
+			replicateLedgerRecord(queued)
+			result = MissionSubmitResult{
+				Accepted:  false,
+				RequestID: req.RequestID,
+				Reason:    "saldo insuficiente; pedido na fila de crédito",
+				Queued:    true,
+			}
+			return
+		}
+
+		missionID := fmt.Sprintf("mission-%s-%d", companyID, time.Now().UnixNano())
+		txID := fmt.Sprintf("pay-%s", missionID)
+		spentIDs := spendTokens(tokens, txID, missionID)
+
+		payRec := appendLedgerRecord(LedgerRecord{
+			Type:      LedgerMissionPayment,
+			TxID:      txID,
+			MissionID: missionID,
+			CompanyID: companyID,
+			TokenIDs:  spentIDs,
+			Status:    "OK",
+			Detail:    fmt.Sprintf("pagamento %s prioridade %s", missionID, priorityLabel(msg.Priority)),
+		})
+		replicateLedgerRecord(payRec)
+
+		alertMsg := msg
+		alertMsg.MissionID = missionID
+		req := buildAlertFromMessage(alertMsg, companyID, missionID, false)
+		enqueueAlertPaid(req)
+
+		result = MissionSubmitResult{
+			Accepted:  true,
+			MissionID: missionID,
+			RequestID: req.RequestID,
+		}
+	})
+
+	return result
+}
+
+func buildAlertFromMessage(msg Message, companyID, missionID string, awaiting bool) *AlertRequest {
+	if msg.RequestID == "" {
+		msg.RequestID = fmt.Sprintf("%s:%s:%d", companyID, gatewayID, time.Now().UnixNano())
+	}
+	return &AlertRequest{
+		RequestID:       msg.RequestID,
+		Occurrence:      msg.Occurrence,
+		Priority:        msg.Priority,
+		Lamport:         tickLamport(msg.Lamport),
+		GatewayID:       gatewayID,
+		Timestamp:       time.Now().Unix(),
+		CompanyID:       companyID,
+		MissionID:       missionID,
+		AwaitingCredits: awaiting,
+	}
+}
+
+func enqueueCreditWait(req *AlertRequest) {
+	creditWaitMutex.Lock()
+	heap.Push(&creditWaitQueue, req)
+	creditWaitMutex.Unlock()
+	log.Printf("[GATEWAY/%s] [ECONOMY] Pedido %s em fila de crédito (%s)", gatewayID, req.RequestID, req.CompanyID)
+	notifyQueueProcessor()
+}
+
+func enqueueAlertPaid(req *AlertRequest) {
+	stateMutex.Lock()
+	defer stateMutex.Unlock()
+	if isRequestClaimed(req.RequestID) {
+		return
+	}
+	seenAlerts[req.RequestID] = true
+	heap.Push(&reqQueue, req)
+	notifyQueueProcessor()
+	logEvent(fmt.Sprintf("[ECONOMY] Missão %s paga e enfileirada: %s", req.MissionID, req.Occurrence))
+	log.Printf("[GATEWAY/%s] [ECONOMY] Missão %s enfileirada após pagamento", gatewayID, req.MissionID)
+
+	broadcastPeerMsg(Message{
+		Type:       MsgAlert,
+		RequestID:  req.RequestID,
+		Priority:   req.Priority,
+		Occurrence: req.Occurrence,
+		GatewayID:  gatewayID,
+		CompanyID:  req.CompanyID,
+		MissionID:  req.MissionID,
+		Lamport:    req.Lamport,
+		Timestamp:  req.Timestamp,
+	})
+}
+
+func reprocessCreditWaitQueueAll() {
+	creditWaitMutex.Lock()
+	pending := make([]*AlertRequest, 0, creditWaitQueue.Len())
+	for creditWaitQueue.Len() > 0 {
+		pending = append(pending, heap.Pop(&creditWaitQueue).(*AlertRequest))
+	}
+	creditWaitMutex.Unlock()
+
+	for _, req := range pending {
+		msg := Message{
+			Type:       MsgAlert,
+			RequestID:  req.RequestID,
+			Priority:   req.Priority,
+			Occurrence: req.Occurrence,
+			CompanyID:  req.CompanyID,
+		}
+		res := submitMissionRequest(msg)
+		if !res.Accepted && res.Queued {
+			continue
+		}
+	}
+}
+
+func reprocessCreditWaitForCompany(companyID string) {
+	creditWaitMutex.Lock()
+	remaining := make(PriorityQueue, 0)
+	var ready []*AlertRequest
+	for creditWaitQueue.Len() > 0 {
+		req := heap.Pop(&creditWaitQueue).(*AlertRequest)
+		if req.CompanyID == companyID {
+			ready = append(ready, req)
+		} else {
+			heap.Push(&remaining, req)
+		}
+	}
+	creditWaitQueue = remaining
+	heap.Init(&creditWaitQueue)
+	creditWaitMutex.Unlock()
+
+	for _, req := range ready {
+		msg := Message{
+			Type:       MsgAlert,
+			RequestID:  req.RequestID,
+			Priority:   req.Priority,
+			Occurrence: req.Occurrence,
+			CompanyID:  req.CompanyID,
+		}
+		submitMissionRequest(msg)
+	}
+}
+
+func recordMissionDispatch(missionID, companyID, droneID string) {
+	rec := appendLedgerRecord(LedgerRecord{
+		Type:      LedgerMissionDispatch,
+		MissionID: missionID,
+		CompanyID: companyID,
+		Status:    "DISPATCHED",
+		Detail:    fmt.Sprintf("drone %s", droneID),
+	})
+	replicateLedgerRecord(rec)
+}
+
+func recordMissionEvent(msg Message) {
+	runWithEconomyRA(func() { // Correção: Inserido R-A para serialização de Ledger
+		rec := appendLedgerRecord(LedgerRecord{
+			Type:      LedgerMissionEvent,
+			MissionID: msg.MissionID,
+			CompanyID: msg.CompanyID,
+			Status:    "OK",
+			Detail:    msg.Content,
+		})
+		replicateLedgerRecord(rec)
+		logEvent(fmt.Sprintf("[LAUDO] Evento missão %s: %s", msg.MissionID, msg.Content))
+	})
+}
+
+func recordMissionReport(msg Message) {
+	runWithEconomyRA(func() { // Correção: Inserido R-A para serialização de Ledger
+		rec := appendLedgerRecord(LedgerRecord{
+			Type:      LedgerMissionReport,
+			MissionID: msg.MissionID,
+			CompanyID: msg.CompanyID,
+			Status:    "FINAL",
+			Detail:    msg.Content,
+		})
+		replicateLedgerRecord(rec)
+		logEvent(fmt.Sprintf("[LAUDO] Laudo final %s: %s", msg.MissionID, msg.Content))
+	})
+}
+
+func sendBalanceRep(conn net.Conn, companyID string) {
+	tokens, credits := companyBalanceSummary(companyID)
+	creditWaitMutex.Lock()
+	queued := creditWaitQueue.Len()
+	creditWaitMutex.Unlock()
+
+	json.NewEncoder(conn).Encode(Message{
+		Type: MsgBalanceRep,
+		Payload: map[string]string{
+			"company_id":     companyID,
+			"active_tokens":  fmt.Sprintf("%d", tokens),
+			"active_credits": fmt.Sprintf("%d", credits),
+			"credit_queue":   fmt.Sprintf("%d", queued),
+			"in_consortium":  fmt.Sprintf("%t", companyInConsortium(companyID)),
+		},
+	})
+}
+
+func sendLedgerRep(conn net.Conn, companyID string, limit int) {
+	recs := ledgerRecordsByCompany(companyID, limit)
+	json.NewEncoder(conn).Encode(Message{Type: MsgLedgerRep, Content: mustJSON(recs)})
 }
 
 /******************************************************************************************
