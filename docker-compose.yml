@@ -174,9 +174,9 @@
         ipv4_address: 172.16.103.100
 
 networks:
-  hormuz_net:
-    driver: bridge
-    ipam:
-      driver: default
-      config:
-        - subnet: 172.16.103.0/24
+    hormuz_net:
+      driver: bridge
+      ipam:
+        driver: default
+        config:
+          - subnet: 172.16.103.0/24
