@@ -1,15 +1,25 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 type Message struct {
@@ -178,7 +188,7 @@ func tryRegisterGateway(idx int, controlAddr string) error {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	addr := gatewayAddrs[idx]
 	name := gatewayNames[idx]
-	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	conn, err := dialTransport(addr, 3*time.Second)
 	if err != nil {
 		log.Printf("%s Falha ao conectar no gateway %s (%s): %v", logPrefix, name, addr, err)
 		return err
@@ -236,7 +246,7 @@ func sendHeartbeat() error {
 		return fmt.Errorf("sem gateway atual")
 	}
 
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	conn, err := dialTransport(addr, 2*time.Second)
 	if err != nil {
 		return err
 	}
@@ -300,7 +310,7 @@ func migrateGateway(controlAddr string) {
 func startCommandListener(controlAddr string) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	listenerAddr := controlAddr
-	listener, err := net.Listen("tcp", listenerAddr)
+	listener, err := listenTransport(listenerAddr)
 	if err != nil {
 		log.Fatalf("%s Falha ao iniciar listener de comando: %v", logPrefix, err)
 	}
@@ -415,7 +425,7 @@ func sendToCurrentGateway(msg Message) {
 	if addr == "" {
 		return
 	}
-	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	conn, err := dialTransport(addr, 3*time.Second)
 	if err != nil {
 		return
 	}
@@ -434,7 +444,7 @@ func sendDroneFailureNotification(reason string) {
 	}
 
 	for _, addr := range gatewayAddrs {
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		conn, err := dialTransport(addr, 3*time.Second)
 		if err != nil {
 			log.Printf("%s [FALHA] Não foi possível notificar gateway %s: %v", logPrefix, addr, err)
 			continue
@@ -465,7 +475,7 @@ func sendRelease() {
 		}
 
 		log.Printf("%s [MISSAO] Enviando RELEASE ao gateway %s", logPrefix, addr)
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		conn, err := dialTransport(addr, 3*time.Second)
 		if err != nil {
 			log.Printf("%s [MISSAO] Falha ao conectar para RELEASE: %v", logPrefix, err)
 			migrateGateway(fmt.Sprintf("%s:%s", deviceHost, deviceControlPort))
@@ -503,6 +513,144 @@ func currentMissionInfo() string {
 	return "sem missão"
 }
 
+// --- QUIC TRANSPORT ABSTRACTION ---
+
+var useQUIC = os.Getenv("USE_QUIC") == "true"
+
+func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
+	if !useQUIC {
+		return net.DialTimeout("tcp", addr, timeout)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"hormuz-quic"},
+	}
+	conn, err := quic.DialAddr(ctx, addr, tlsConf, nil)
+	if err != nil {
+		return nil, fmt.Errorf("quic dial error: %w", err)
+	}
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		conn.CloseWithError(0, "failed to open stream")
+		return nil, fmt.Errorf("quic stream error: %w", err)
+	}
+	return &quicConnWrapper{Stream: stream, conn: conn}, nil
+}
+
+type transportListener struct {
+	tcpListener  net.Listener
+	quicListener *quic.Listener
+	isQUIC       bool
+	acceptChan   chan net.Conn
+	errChan      chan error
+}
+
+func listenTransport(addr string) (*transportListener, error) {
+	if !useQUIC {
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return &transportListener{tcpListener: l, isQUIC: false}, nil
+	}
+	tlsConf := generateTLSConfig()
+	l, err := quic.ListenAddr(addr, tlsConf, nil)
+	if err != nil {
+		return nil, err
+	}
+	tl := &transportListener{
+		quicListener: l,
+		isQUIC:       true,
+		acceptChan:   make(chan net.Conn),
+		errChan:      make(chan error),
+	}
+	go tl.acceptLoop()
+	return tl, nil
+}
+
+func (tl *transportListener) acceptLoop() {
+	for {
+		conn, err := tl.quicListener.Accept(context.Background())
+		if err != nil {
+			tl.errChan <- err
+			return
+		}
+		go func(c quic.Connection) {
+			for {
+				stream, err := c.AcceptStream(context.Background())
+				if err != nil {
+					return
+				}
+				tl.acceptChan <- &quicConnWrapper{Stream: stream, conn: c}
+			}
+		}(conn)
+	}
+}
+
+func (tl *transportListener) Accept() (net.Conn, error) {
+	if !tl.isQUIC {
+		return tl.tcpListener.Accept()
+	}
+	select {
+	case conn := <-tl.acceptChan:
+		return conn, nil
+	case err := <-tl.errChan:
+		return nil, err
+	}
+}
+
+func (tl *transportListener) Close() error {
+	if !tl.isQUIC {
+		return tl.tcpListener.Close()
+	}
+	return tl.quicListener.Close()
+}
+
+func (tl *transportListener) Addr() net.Addr {
+	if !tl.isQUIC {
+		return tl.tcpListener.Addr()
+	}
+	return tl.quicListener.Addr()
+}
+
+type quicConnWrapper struct {
+	quic.Stream
+	conn quic.Connection
+}
+
+func (w *quicConnWrapper) LocalAddr() net.Addr  { return w.conn.LocalAddr() }
+func (w *quicConnWrapper) RemoteAddr() net.Addr { return w.conn.RemoteAddr() }
+func (w *quicConnWrapper) Close() error         { return w.Stream.Close() }
+
+func generateTLSConfig() *tls.Config {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"Hormuz"}},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"hormuz-quic"}}
+}
+
 /******************************************************************************************
 
 Autor: Walace de Jesus Venas
@@ -516,3 +664,4 @@ do código, e estou ciente que estes trechos não serão considerados para fins 
 Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-Agrawala.
 
 *******************************************************************************************/
+

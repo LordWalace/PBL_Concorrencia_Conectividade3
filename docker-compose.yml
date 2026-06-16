@@ -1,4 +1,4 @@
-﻿services:
+services:
   gateway-norte:
     build: ./gateway
     container_name: gateway-norte
@@ -172,6 +172,15 @@
     networks:
       hormuz_net:
         ipv4_address: 172.16.103.100
+  admin:
+    build: ./admin
+    container_name: admin
+    env_file: .env
+    stdin_open: true
+    tty: true
+    networks:
+      hormuz_net:
+        ipv4_address: 172.16.103.101
 
 networks:
     hormuz_net:

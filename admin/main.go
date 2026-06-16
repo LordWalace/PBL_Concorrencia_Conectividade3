@@ -1,0 +1,540 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	crand "crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"log"
+	"math/big"
+	"math/rand"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/quic-go/quic-go"
+)
+
+type Message struct {
+	Type        string            `json:"type"`
+	DroneID     string            `json:"drone_id,omitempty"`
+	GatewayID   string            `json:"gateway_id,omitempty"`
+	RequestID   string            `json:"request_id,omitempty"`
+	Priority    int               `json:"priority,omitempty"`
+	Lamport     int               `json:"lamport,omitempty"`
+	Timestamp   int64             `json:"timestamp,omitempty"`
+	Payload     map[string]string `json:"payload,omitempty"`
+	Content     string            `json:"content,omitempty"`
+	Status      string            `json:"status,omitempty"`
+	CompanyID   string            `json:"company_id,omitempty"`
+}
+
+func mustEnv(key string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		log.Fatalf("Variável de ambiente %s não configurada", key)
+	}
+	return val
+}
+
+func getAvailableGatewayConn(gateways map[string]string) (net.Conn, string, error) {
+	for name, addr := range gateways {
+		conn, err := dialTransport(addr, 3*time.Second)
+		if err == nil {
+			return conn, name, nil
+		}
+	}
+	return nil, "", fmt.Errorf("nenhum gateway disponível no momento")
+}
+
+func getCompanyList(gateways map[string]string) ([]string, error) {
+	conn, _, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	
+	msg := Message{Type: "COMPANY_LIST_REQ"}
+	json.NewEncoder(conn).Encode(msg)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+		return nil, err
+	}
+	if reply.Type != "COMPANY_LIST_REP" {
+		return nil, fmt.Errorf("invalid reply")
+	}
+	
+	var list []string
+	json.Unmarshal([]byte(reply.Content), &list)
+	return list, nil
+}
+
+func selectCompany(reader *bufio.Reader, gateways map[string]string) string {
+	fmt.Println("Conectando ao gateway para obter lista de empresas...")
+	list, err := getCompanyList(gateways)
+	if err != nil || len(list) == 0 {
+		fmt.Println("[ERRO] Nenhuma empresa cadastrada ou malha offline.")
+		return ""
+	}
+	fmt.Println("\nSelecione a empresa:")
+	for i, c := range list {
+		fmt.Printf("%d - %s\n", i+1, c)
+	}
+	fmt.Println("0 - Voltar")
+	fmt.Print("\nEscolha: ")
+	
+	for {
+		line, _ := reader.ReadString('\n')
+		idx, err := strconv.Atoi(strings.TrimSpace(line))
+		if err == nil {
+			if idx == 0 {
+				return ""
+			}
+			if idx > 0 && idx <= len(list) {
+				return list[idx-1]
+			}
+		}
+		fmt.Print("Entrada inválida. Escolha: ")
+	}
+}
+
+func main() {
+	rand.Seed(time.Now().UnixNano())
+
+	clientPort := mustEnv("GATEWAY_TCP_CLIENT_PORT")
+	gateways := map[string]string{
+		"Norte": fmt.Sprintf("%s:%s", mustEnv("IP_NORTE"), clientPort),
+		"Sul":   fmt.Sprintf("%s:%s", mustEnv("IP_SUL"), clientPort),
+		"Leste": fmt.Sprintf("%s:%s", mustEnv("IP_LESTE"), clientPort),
+		"Oeste": fmt.Sprintf("%s:%s", mustEnv("IP_OESTE"), clientPort),
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	skipNextClear := false
+
+	for {
+		if !skipNextClear {
+			clearScreen()
+		} else {
+			skipNextClear = false
+		}
+
+		fmt.Println("======================================")
+		fmt.Println("  ADMINISTRAÇÃO DO CONSÓRCIO HORMUZ")
+		fmt.Println("======================================")
+		fmt.Println("\nMenu Admin:")
+		fmt.Println("1 - Cadastrar Nova Empresa/Navio")
+		fmt.Println("2 - Adicionar Créditos Manualmente")
+		fmt.Println("3 - Consultar Saldo da Empresa")
+		fmt.Println("4 - Consultar Arrecadação do Consórcio Hormuz")
+		fmt.Println("5 - Histórico e Auditoria")
+		fmt.Println("0 - Sair")
+		fmt.Print("Escolha uma opção (ou Enter para atualizar): ")
+
+		choice := readChoice(reader)
+
+		switch choice {
+		case "1":
+			clearScreen()
+			adminRegisterCompany(reader, gateways)
+			skipNextClear = true
+
+		case "2":
+			clearScreen()
+			adminCredit(reader, gateways)
+			skipNextClear = true
+
+		case "3":
+			clearScreen()
+			adminBalance(reader, gateways)
+			skipNextClear = true
+
+		case "4":
+			clearScreen()
+			adminRevenue(reader, gateways)
+			skipNextClear = true
+
+		case "5":
+			clearScreen()
+			adminAudit(reader, gateways)
+			skipNextClear = true
+
+		case "":
+			clearMenuLines(13)
+			continue
+
+		case "0":
+			clearScreen()
+			fmt.Println("Encerrando admin.")
+			return
+
+		default:
+			clearMenuLines(13)
+			continue
+		}
+	}
+}
+
+func adminRegisterCompany(reader *bufio.Reader, gateways map[string]string) {
+	fmt.Println("--- CADASTRAR NOVA EMPRESA / NAVIO ---")
+	fmt.Print("Digite o nome/ID da nova empresa (ou 0 para cancelar): ")
+	companyID := readChoice(reader)
+	if companyID == "0" || companyID == "" {
+		return
+	}
+
+	conn, _, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		fmt.Println("\n[ERRO] Malha offline.")
+		reader.ReadString('\n')
+		return
+	}
+	defer conn.Close()
+
+	msg := Message{Type: "COMPANY_REG", CompanyID: companyID}
+	json.NewEncoder(conn).Encode(msg)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err == nil && reply.Type == "COMPANY_ACK" {
+		fmt.Printf("\n[SUCESSO] Empresa %s cadastrada com sucesso!\n", companyID)
+	} else {
+		fmt.Println("\n[ERRO] Falha ao cadastrar.")
+	}
+	fmt.Println("\nPressione Enter para voltar ao menu...")
+	reader.ReadString('\n')
+}
+
+func adminCredit(reader *bufio.Reader, gateways map[string]string) {
+	fmt.Println("--- ADICIONAR CRÉDITOS MANUALMENTE ---")
+	companyID := selectCompany(reader, gateways)
+	if companyID == "" {
+		return
+	}
+
+	fmt.Printf("\nQuantos créditos deseja adicionar à empresa '%s'? ", companyID)
+	amountStr := readChoice(reader)
+	amount, err := strconv.Atoi(amountStr)
+	if err != nil || amount <= 0 {
+		fmt.Println("Valor inválido.")
+		reader.ReadString('\n')
+		return
+	}
+
+	conn, _, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		fmt.Println("\n[ERRO] Malha offline.")
+		reader.ReadString('\n')
+		return
+	}
+	defer conn.Close()
+
+	msg := Message{Type: "ADMIN_CREDIT", CompanyID: companyID, Payload: map[string]string{"amount": amountStr}}
+	json.NewEncoder(conn).Encode(msg)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err == nil && reply.Type == "ADMIN_CREDIT_ACK" {
+		if reply.Status == "OK" {
+			fmt.Printf("\n[SUCESSO] %s\n", reply.Content)
+		} else {
+			fmt.Printf("\n[ERRO] %s\n", reply.Content)
+		}
+	} else {
+		fmt.Println("\n[ERRO] Falha ao comunicar crédito manual.")
+	}
+	fmt.Println("\nPressione Enter para voltar ao menu...")
+	reader.ReadString('\n')
+}
+
+func adminBalance(reader *bufio.Reader, gateways map[string]string) {
+	fmt.Println("--- SALDO DA EMPRESA ---")
+	companyID := selectCompany(reader, gateways)
+	if companyID == "" {
+		return
+	}
+
+	conn, gwName, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		fmt.Println("\n[ERRO] Malha offline.")
+		reader.ReadString('\n')
+		return
+	}
+	defer conn.Close()
+
+	msg := Message{Type: "BALANCE_REQ", CompanyID: companyID}
+	json.NewEncoder(conn).Encode(msg)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err == nil && reply.Type == "BALANCE_REP" {
+		fmt.Printf("\n[Gateway %s] Saldo da empresa %s: %s créditos\n", gwName, companyID, reply.Content)
+	} else {
+		fmt.Println("\n[ERRO] Falha ao consultar saldo.")
+	}
+	fmt.Println("\nPressione Enter para voltar ao menu...")
+	reader.ReadString('\n')
+}
+
+func adminRevenue(reader *bufio.Reader, gateways map[string]string) {
+	fmt.Println("--- ARRECADAÇÃO DO CONSÓRCIO HORMUZ ---")
+	conn, _, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		fmt.Println("\n[ERRO] Toda a malha está offline.")
+		reader.ReadString('\n')
+		return
+	}
+	defer conn.Close()
+
+	msg := Message{Type: "REVENUE_REQ"}
+	json.NewEncoder(conn).Encode(msg)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err == nil && reply.Type == "REVENUE_REP" {
+		total := reply.Payload["total_arrecadado"]
+		emissoes := reply.Payload["emissoes"]
+		fmt.Println("\n=======================================================")
+		fmt.Printf(" FATURAMENTO TOTAL DO CONSÓRCIO HORMUZ: %s CRÉDITOS\n", total)
+		fmt.Println("=======================================================")
+		fmt.Println("\nℹ️  Todos os créditos descontados das embarcações por")
+		fmt.Println("   acionamentos de emergência.")
+		fmt.Printf("\nEventos de emissão na malha (Inicial/Periódico/Admin): %s\n", emissoes)
+	} else {
+		fmt.Println("\n[ERRO] Falha ao consultar arrecadação.")
+	}
+
+	fmt.Println("\nPressione Enter para voltar ao menu...")
+	reader.ReadString('\n')
+}
+
+func adminAudit(reader *bufio.Reader, gateways map[string]string) {
+	for {
+		clearScreen()
+		fmt.Println("--- HISTÓRICO E AUDITORIA ---")
+		fmt.Println("1 - Ver Ledger Global")
+		fmt.Println("2 - Ver Ledger por Empresa")
+		fmt.Println("3 - Ver Tokens Gastos por Empresa")
+		fmt.Println("0 - Voltar")
+		fmt.Print("Escolha: ")
+		
+		choice := readChoice(reader)
+		switch choice {
+		case "1":
+			adminLedgerGlobal(reader, gateways)
+		case "2":
+			adminLedgerCompany(reader, gateways)
+		case "3":
+			adminSpentTokens(reader, gateways)
+		case "0":
+			return
+		}
+	}
+}
+
+func adminLedgerGlobal(reader *bufio.Reader, gateways map[string]string) {
+	fmt.Println("\n--- LEDGER GLOBAL ---")
+	conn, gwName, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		fmt.Println("\n[ERRO] Malha offline.")
+		reader.ReadString('\n')
+		return
+	}
+	defer conn.Close()
+
+	msg := Message{Type: "LEDGER_GLOBAL_REQ"}
+	json.NewEncoder(conn).Encode(msg)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+		fmt.Println("\n[ERRO] Falha ao ler resposta.")
+		reader.ReadString('\n')
+		return
+	}
+	
+	var recs []map[string]interface{}
+	json.Unmarshal([]byte(reply.Content), &recs)
+
+	fmt.Printf("\n[Gateway %s] - Últimos blocos globais:\n\n", gwName)
+	if len(recs) == 0 {
+		fmt.Println("Nenhum registro encontrado.")
+	} else {
+		for i, r := range recs {
+			t := ""
+			if typeVal, ok := r["type"].(string); ok { t = typeVal }
+			tsVal, _ := r["timestamp"].(float64)
+			date := time.Unix(int64(tsVal), 0).Format("15:04:05")
+			compId := ""
+			if c, ok := r["company_id"].(string); ok { compId = c }
+			detail := ""
+			if d, ok := r["detail"].(string); ok { detail = d }
+			fmt.Printf("%d. [%s] %s | Cia: %s | Detalhe: %s\n", i+1, date, t, compId, detail)
+		}
+	}
+	fmt.Println("\nPressione Enter para voltar...")
+	reader.ReadString('\n')
+}
+
+func adminLedgerCompany(reader *bufio.Reader, gateways map[string]string) {
+	fmt.Println("\n--- LEDGER POR EMPRESA ---")
+	companyID := selectCompany(reader, gateways)
+	if companyID == "" {
+		return
+	}
+	conn, gwName, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		fmt.Println("\n[ERRO] Malha offline.")
+		reader.ReadString('\n')
+		return
+	}
+	defer conn.Close()
+
+	msg := Message{Type: "LEDGER_REQ", CompanyID: companyID, Payload: map[string]string{"limit": "50"}}
+	json.NewEncoder(conn).Encode(msg)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+		fmt.Println("\n[ERRO] Falha ao ler resposta.")
+		reader.ReadString('\n')
+		return
+	}
+	var recs []map[string]interface{}
+	json.Unmarshal([]byte(reply.Content), &recs)
+
+	fmt.Printf("\n[Gateway %s] - Blocos da empresa %s:\n\n", gwName, companyID)
+	if len(recs) == 0 {
+		fmt.Println("Nenhum registro encontrado.")
+	} else {
+		for i, r := range recs {
+			t := ""
+			if typeVal, ok := r["type"].(string); ok { t = typeVal }
+			tsVal, _ := r["timestamp"].(float64)
+			date := time.Unix(int64(tsVal), 0).Format("15:04:05")
+			detail := ""
+			if d, ok := r["detail"].(string); ok { detail = d }
+			fmt.Printf("%d. [%s] %s | Detalhe: %s\n", i+1, date, t, detail)
+		}
+	}
+	fmt.Println("\nPressione Enter para voltar...")
+	reader.ReadString('\n')
+}
+
+func adminSpentTokens(reader *bufio.Reader, gateways map[string]string) {
+	fmt.Println("\n--- TOKENS GASTOS POR EMPRESA ---")
+	companyID := selectCompany(reader, gateways)
+	if companyID == "" {
+		return
+	}
+	conn, _, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		fmt.Println("\n[ERRO] Malha offline.")
+		reader.ReadString('\n')
+		return
+	}
+	defer conn.Close()
+
+	msg := Message{Type: "SPENT_TOKENS_REQ", CompanyID: companyID}
+	json.NewEncoder(conn).Encode(msg)
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var reply Message
+	if err := json.NewDecoder(conn).Decode(&reply); err == nil && reply.Type == "SPENT_TOKENS_REP" {
+		fmt.Println("\n=======================================================")
+		fmt.Printf(" AUDITORIA DE TOKENS DA EMPRESA: %s\n", companyID)
+		fmt.Println("=======================================================")
+		fmt.Printf("- Tokens Ativos na carteira: %s (%s créditos)\n", reply.Payload["active_count"], reply.Payload["active_credits"])
+		fmt.Printf("- Tokens Gastos (transferidos ao admin): %s (%s créditos)\n", reply.Payload["spent_count"], reply.Payload["spent_credits"])
+	} else {
+		fmt.Println("\n[ERRO] Falha ao consultar tokens gastos.")
+	}
+	fmt.Println("\nPressione Enter para voltar...")
+	reader.ReadString('\n')
+}
+
+func readChoice(reader *bufio.Reader) string {
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		time.Sleep(2 * time.Second)
+		os.Exit(1)
+		return ""
+	}
+	return strings.TrimSpace(line)
+}
+
+func clearScreen() {
+	fmt.Print("\033[H\033[2J\033[3J")
+}
+
+func clearMenuLines(linhas int) {
+	fmt.Printf("\033[%dA\033[J", linhas)
+}
+
+// --- QUIC TRANSPORT ABSTRACTION ---
+
+var useQUIC = os.Getenv("USE_QUIC") == "true"
+
+func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
+	if !useQUIC {
+		return net.DialTimeout("tcp", addr, timeout)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"hormuz-quic"},
+	}
+	conn, err := quic.DialAddr(ctx, addr, tlsConf, nil)
+	if err != nil {
+		return nil, fmt.Errorf("quic dial error: %w", err)
+	}
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		conn.CloseWithError(0, "failed to open stream")
+		return nil, fmt.Errorf("quic stream error: %w", err)
+	}
+	return &quicConnWrapper{Stream: stream, conn: conn}, nil
+}
+
+type quicConnWrapper struct {
+	quic.Stream
+	conn quic.Connection
+}
+
+func (w *quicConnWrapper) LocalAddr() net.Addr  { return w.conn.LocalAddr() }
+func (w *quicConnWrapper) RemoteAddr() net.Addr { return w.conn.RemoteAddr() }
+func (w *quicConnWrapper) Close() error         { return w.Stream.Close() }
+
+func generateTLSConfig() *tls.Config {
+	key, err := rsa.GenerateKey(crand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"Hormuz"}},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	certDER, err := x509.CreateCertificate(crand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"hormuz-quic"}}
+}

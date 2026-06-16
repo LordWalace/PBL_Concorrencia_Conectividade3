@@ -2,11 +2,19 @@ package main
 
 import (
 	"container/heap"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
 	"os"
 	"sort"
@@ -14,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -44,6 +54,16 @@ const (
 	MsgCompanyReg       = "COMPANY_REG"
 	MsgMissionEvent     = "MISSION_EVENT"
 	MsgMissionReport    = "MISSION_REPORT"
+	MsgCompanyListReq   = "COMPANY_LIST_REQ"
+	MsgCompanyListRep   = "COMPANY_LIST_REP"
+	MsgAdminCredit      = "ADMIN_CREDIT"
+	MsgAdminCreditAck   = "ADMIN_CREDIT_ACK"
+	MsgRevenueReq       = "REVENUE_REQ"
+	MsgRevenueRep       = "REVENUE_REP"
+	MsgLedgerGlobalReq  = "LEDGER_GLOBAL_REQ"
+	MsgLedgerGlobalRep  = "LEDGER_GLOBAL_REP"
+	MsgSpentTokensReq   = "SPENT_TOKENS_REQ"
+	MsgSpentTokensRep   = "SPENT_TOKENS_REP"
 )
 
 const (
@@ -57,6 +77,7 @@ const (
 	TokenCreditAmount   = 10
 	LedgerTokenMintInitial  = "TOKEN_MINT_INITIAL"
 	LedgerTokenMintPeriodic = "TOKEN_MINT_PERIODIC"
+	LedgerTokenMintAdmin    = "TOKEN_MINT_ADMIN"
 	LedgerMissionPayment    = "MISSION_PAYMENT"
 	LedgerMissionDenied     = "MISSION_PAYMENT_DENIED"
 	LedgerMissionQueued     = "MISSION_QUEUED_CREDIT"
@@ -318,6 +339,8 @@ func removeAlertFromQueue(requestID string) {
 	}
 }
 
+
+
 func ensureRequestID(msg *Message) {
 	if msg.RequestID == "" {
 		msg.RequestID = fmt.Sprintf("%s:%d:%d", gatewayID, time.Now().UnixNano(), tickLamport(msg.Lamport))
@@ -442,7 +465,7 @@ func main() {
 
 func startServer(host, port string, handler func(net.Conn)) {
 	addr := fmt.Sprintf("%s:%s", host, port)
-	listener, err := net.Listen("tcp", addr)
+	listener, err := listenTransport(addr)
 	if err != nil {
 		log.Fatalf("[GATEWAY/%s] Falha ao escutar em %s: %v", gatewayID, addr, err)
 	}
@@ -597,6 +620,16 @@ func handleClientConnection(conn net.Conn) {
 		sendStatusRep(conn)
 	case MsgEventsReq:
 		sendEventsRep(conn, msg)
+	case MsgCompanyListReq:
+		handleCompanyListReq(msg, conn)
+	case MsgAdminCredit:
+		handleAdminCredit(msg, conn)
+	case MsgRevenueReq:
+		handleRevenueReq(msg, conn)
+	case MsgLedgerGlobalReq:
+		handleLedgerGlobalReq(msg, conn)
+	case MsgSpentTokensReq:
+		handleSpentTokensReq(msg, conn)
 	}
 }
 
@@ -783,6 +816,8 @@ func handleRAReply(msg Message) {
 		}
 	}
 }
+
+
 
 func handleRARelease(msg Message) {
 	stateMutex.Lock()
@@ -1043,7 +1078,7 @@ func dispatchDrone(droneID string) {
 		return
 	}
 
-	conn, err := net.DialTimeout("tcp", controlAddr, 3*time.Second)
+	conn, err := dialTransport(controlAddr, 3*time.Second)
 	if err != nil {
 		log.Printf("[GATEWAY/%s] [FALHA] Não foi possível conectar ao drone %s: %v", gatewayID, normalizeDroneID(droneID), err)
 		handleLocalDroneFailure(droneID, "conexão falhou")
@@ -1353,6 +1388,8 @@ func monitorLocalDroneHeartbeats() {
 	}
 }
 
+
+
 func markPeerOffline(peerID string, duration time.Duration, reason string) {
 	stateMutex.Lock()
 	peerOfflineUntil[peerID] = time.Now().Add(duration)
@@ -1380,6 +1417,8 @@ func sendPendingPeerMessages(peerID string) {
 		}
 	}
 }
+
+
 
 func broadcastPeerMsg(msg Message) {
 	for _, peerID := range peerIDs {
@@ -1437,7 +1476,7 @@ func sendDirectWithRetry(targetGateway string, msg Message, maxAttempts int) err
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		conn, err := dialTransport(addr, 2*time.Second)
 		if err != nil {
 			lastErr = err
 			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
@@ -1538,6 +1577,8 @@ func startPeerHealthMonitor() {
 	}
 }
 
+
+
 func getReplyChannel(droneID, peerID string) chan struct{} {
 	replyChannelMutex.Lock()
 	defer replyChannelMutex.Unlock()
@@ -1585,10 +1626,7 @@ func logEvent(event string) {
 // --- LEDGER / ECONOMY / TRANSPORT ---
 
 func dialPeerTransport(addr string) (net.Conn, error) {
-	if useQUICTransport {
-		// Ponto de extensão QUIC
-	}
-	return net.DialTimeout("tcp", addr, 2*time.Second)
+	return dialTransport(addr, 2*time.Second)
 }
 
 func ledgerFilePath() string {
@@ -1625,27 +1663,49 @@ func loadLedgerFromDisk() {
 	if mintRoundsDone == nil {
 		mintRoundsDone = make(map[string]bool)
 	}
-	rebuildCompanyTokenIndex()
+	rebuildCompanyTokenIndexLocked()
 	ledgerSeq = len(ledgerRecords)
 	log.Printf("[GATEWAY/%s] [LEDGER] Restaurado com %d registros", gatewayID, len(ledgerRecords))
 }
 
 func persistLedgerToDisk() {
 	ledgerMutex.RLock()
+	
+	recs := append([]LedgerRecord(nil), ledgerRecords...)
+	
+	toks := make(map[string]*Token, len(ledgerTokens))
+	for k, v := range ledgerTokens {
+		copyTok := *v
+		toks[k] = &copyTok
+	}
+	
+	comps := make(map[string]*Company, len(companies))
+	for k, v := range companies {
+		copyC := *v
+		comps[k] = &copyC
+	}
+	
+	rounds := make(map[string]bool, len(mintRoundsDone))
+	for k, v := range mintRoundsDone {
+		rounds[k] = v
+	}
+	
+	ledgerMutex.RUnlock()
+
 	snapshot := struct {
 		Records    []LedgerRecord    `json:"records"`
 		Tokens     map[string]*Token `json:"tokens"`
 		Companies  map[string]*Company `json:"companies"`
 		MintRounds map[string]bool   `json:"mint_rounds"`
 	}{
-		Records:    append([]LedgerRecord(nil), ledgerRecords...),
-		Tokens:     ledgerTokens,
-		Companies:  companies,
-		MintRounds: mintRoundsDone,
+		Records:    recs,
+		Tokens:     toks,
+		Companies:  comps,
+		MintRounds: rounds,
 	}
-	ledgerMutex.RUnlock()
 
 	data, err := json.Marshal(snapshot)
+
 	if err != nil {
 		return
 	}
@@ -1656,7 +1716,7 @@ func persistLedgerToDisk() {
 	_ = os.Rename(tmp, ledgerFilePath())
 }
 
-func rebuildCompanyTokenIndex() {
+func rebuildCompanyTokenIndexLocked() {
 	companyTokens = make(map[string][]string)
 	spentTokenIDs = make(map[string]bool) // Correção: limpeza para state sync seguro
 	for id, tok := range ledgerTokens {
@@ -1668,6 +1728,8 @@ func rebuildCompanyTokenIndex() {
 		}
 	}
 }
+
+
 
 func hashLedgerPayload(payload string) string {
 	sum := sha256.Sum256([]byte(payload))
@@ -1730,7 +1792,10 @@ func companyInConsortium(companyID string) bool {
 	return ok && c.InConsortium
 }
 
-func mintTokensLocked(companyID string, count int, recordType, mintRoundID, detail string) ([]*Token, LedgerRecord) {
+func mintTokens(companyID string, count int, recordType, mintRoundID, detail string) ([]*Token, LedgerRecord) {
+	ledgerMutex.Lock()
+	defer ledgerMutex.Unlock()
+	
 	txID := fmt.Sprintf("tx-%s-%d", companyID, time.Now().UnixNano())
 	created := make([]*Token, 0, count)
 	tokenIDs := make([]string, 0, count)
@@ -1810,12 +1875,12 @@ func spendTokens(tokens []*Token, txID, missionID string) []string {
 		tok.SpentInTx = txID
 		spentTokenIDs[tok.TokenID] = true
 		ids = append(ids, tok.TokenID)
-		removeTokenFromCompanyIndex(tok.OwnerID, tok.TokenID)
+		removeTokenFromCompanyIndexLocked(tok.OwnerID, tok.TokenID)
 	}
 	return ids
 }
 
-func removeTokenFromCompanyIndex(companyID, tokenID string) {
+func removeTokenFromCompanyIndexLocked(companyID, tokenID string) {
 	list := companyTokens[companyID]
 	for i, id := range list {
 		if id == tokenID {
@@ -1824,6 +1889,8 @@ func removeTokenFromCompanyIndex(companyID, tokenID string) {
 		}
 	}
 }
+
+
 
 func tokensCostForPriority(priority int) int {
 	if priority < 1 {
@@ -1932,7 +1999,7 @@ func importLedgerSnapshot(recs []LedgerRecord, toks map[string]*Token, comps map
 	ledgerTokens = toks
 	companies = comps
 	mintRoundsDone = rounds
-	rebuildCompanyTokenIndex()
+	rebuildCompanyTokenIndexLocked()
 	ledgerSeq = len(ledgerRecords)
 	sort.Slice(ledgerRecords, func(i, j int) bool {
 		return ledgerRecords[i].Timestamp < ledgerRecords[j].Timestamp
@@ -2020,7 +2087,7 @@ func mintInitialCredits(companyID string) {
 		if activeTokenCount(companyID) > 0 {
 			return
 		}
-		_, rec := mintTokensLocked(companyID, 10, LedgerTokenMintInitial, "", "emissão inicial 100 créditos")
+		_, rec := mintTokens(companyID, 10, LedgerTokenMintInitial, "", "emissão inicial 100 créditos")
 		full := appendLedgerRecord(rec)
 		replicateLedgerRecord(full)
 		log.Printf("[GATEWAY/%s] [ECONOMY] Companhia %s recebeu 100 créditos iniciais", gatewayID, companyID)
@@ -2048,7 +2115,7 @@ func executePeriodicMint() {
 		ledgerMutex.RUnlock()
 
 		for _, companyID := range companyIDs {
-			_, rec := mintTokensLocked(companyID, 5, LedgerTokenMintPeriodic, roundID,
+			_, rec := mintTokens(companyID, 5, LedgerTokenMintPeriodic, roundID,
 				fmt.Sprintf("recarga periódica 50 créditos (%s)", roundID))
 			full := appendLedgerRecord(rec)
 			replicateLedgerRecord(full)
@@ -2102,8 +2169,8 @@ func handleLedgerRecordFromPeer(msg Message) {
 			}
 			companyTokens[rec.CompanyID] = append(companyTokens[rec.CompanyID], tid)
 		}
+		rebuildCompanyTokenIndexLocked()
 		ledgerMutex.Unlock()
-		rebuildCompanyTokenIndex()
 	}
 	go persistLedgerToDisk()
 }
@@ -2256,6 +2323,8 @@ func reprocessCreditWaitQueueAll() {
 	}
 }
 
+
+
 func reprocessCreditWaitForCompany(companyID string) {
 	creditWaitMutex.Lock()
 	remaining := make(PriorityQueue, 0)
@@ -2359,3 +2428,267 @@ do código, e estou ciente que estes trechos não serão considerados para fins 
 Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-Agrawala.
 
 *******************************************************************************************/
+
+// --- QUIC TRANSPORT ABSTRACTION ---
+
+var useQUIC = os.Getenv("USE_QUIC") == "true"
+
+func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
+	if !useQUIC {
+		return net.DialTimeout("tcp", addr, timeout)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"hormuz-quic"},
+	}
+	conn, err := quic.DialAddr(ctx, addr, tlsConf, nil)
+	if err != nil {
+		return nil, fmt.Errorf("quic dial error: %w", err)
+	}
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		conn.CloseWithError(0, "failed to open stream")
+		return nil, fmt.Errorf("quic stream error: %w", err)
+	}
+	return &quicConnWrapper{Stream: stream, conn: conn}, nil
+}
+
+type transportListener struct {
+	tcpListener  net.Listener
+	quicListener *quic.Listener
+	isQUIC       bool
+	acceptChan   chan net.Conn
+	errChan      chan error
+}
+
+func listenTransport(addr string) (*transportListener, error) {
+	if !useQUIC {
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return &transportListener{tcpListener: l, isQUIC: false}, nil
+	}
+	tlsConf := generateTLSConfig()
+	l, err := quic.ListenAddr(addr, tlsConf, nil)
+	if err != nil {
+		return nil, err
+	}
+	tl := &transportListener{
+		quicListener: l,
+		isQUIC:       true,
+		acceptChan:   make(chan net.Conn),
+		errChan:      make(chan error),
+	}
+	go tl.acceptLoop()
+	return tl, nil
+}
+
+func (tl *transportListener) acceptLoop() {
+	for {
+		conn, err := tl.quicListener.Accept(context.Background())
+		if err != nil {
+			tl.errChan <- err
+			return
+		}
+		go func(c quic.Connection) {
+			for {
+				stream, err := c.AcceptStream(context.Background())
+				if err != nil {
+					return
+				}
+				tl.acceptChan <- &quicConnWrapper{Stream: stream, conn: c}
+			}
+		}(conn)
+	}
+}
+
+func (tl *transportListener) Accept() (net.Conn, error) {
+	if !tl.isQUIC {
+		return tl.tcpListener.Accept()
+	}
+	select {
+	case conn := <-tl.acceptChan:
+		return conn, nil
+	case err := <-tl.errChan:
+		return nil, err
+	}
+}
+
+func (tl *transportListener) Close() error {
+	if !tl.isQUIC {
+		return tl.tcpListener.Close()
+	}
+	return tl.quicListener.Close()
+}
+
+func (tl *transportListener) Addr() net.Addr {
+	if !tl.isQUIC {
+		return tl.tcpListener.Addr()
+	}
+	return tl.quicListener.Addr()
+}
+
+type quicConnWrapper struct {
+	quic.Stream
+	conn quic.Connection
+}
+
+func (w *quicConnWrapper) LocalAddr() net.Addr  { return w.conn.LocalAddr() }
+func (w *quicConnWrapper) RemoteAddr() net.Addr { return w.conn.RemoteAddr() }
+func (w *quicConnWrapper) Close() error         { return w.Stream.Close() }
+
+func generateTLSConfig() *tls.Config {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"Hormuz"}},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"hormuz-quic"}}
+}
+
+func handleCompanyListReq(msg Message, conn net.Conn) {
+	ledgerMutex.RLock()
+	var companyIDs []string
+	for id, comp := range companies {
+		if comp.InConsortium {
+			companyIDs = append(companyIDs, id)
+		}
+	}
+	ledgerMutex.RUnlock()
+	sort.Strings(companyIDs)
+	content, _ := json.Marshal(companyIDs)
+	json.NewEncoder(conn).Encode(Message{Type: MsgCompanyListRep, Content: string(content)})
+}
+
+func handleAdminCredit(msg Message, conn net.Conn) {
+	companyID := msg.CompanyID
+	if companyID == "" && msg.Payload != nil {
+		companyID = msg.Payload["company_id"]
+	}
+	amountStr := "0"
+	if msg.Payload != nil {
+		if a, ok := msg.Payload["amount"]; ok {
+			amountStr = a
+		}
+	}
+	amount, _ := strconv.Atoi(amountStr)
+	if amount <= 0 {
+		json.NewEncoder(conn).Encode(Message{Type: MsgAdminCreditAck, Status: "ERROR", Content: "Valor invalido"})
+		return
+	}
+	if !companyInConsortium(companyID) {
+		json.NewEncoder(conn).Encode(Message{Type: MsgAdminCreditAck, Status: "ERROR", Content: "Empresa nao existe"})
+		return
+	}
+
+	tokensToMint := amount / TokenCreditAmount
+	if tokensToMint == 0 {
+		tokensToMint = 1
+	}
+
+	runWithEconomyRA(func() {
+		created, rec := mintTokens(companyID, tokensToMint, LedgerTokenMintAdmin, "", fmt.Sprintf("Credito manual admin: %d creditos", tokensToMint*TokenCreditAmount))
+		full := appendLedgerRecord(rec)
+		replicateLedgerRecord(full)
+		log.Printf("[GATEWAY/%s] [ADMIN] Credito manual: %s recebeu %d creditos", gatewayID, companyID, tokensToMint*TokenCreditAmount)
+		json.NewEncoder(conn).Encode(Message{
+			Type: MsgAdminCreditAck, 
+			Status: "OK", 
+			Content: fmt.Sprintf("Emitidos %d creditos para %s", len(created)*TokenCreditAmount, companyID),
+		})
+	})
+}
+
+func handleRevenueReq(msg Message, conn net.Conn) {
+	ledgerMutex.RLock()
+	totalArrecadado := 0
+	emissoes := 0
+	for _, rec := range ledgerRecords {
+		if rec.Type == LedgerMissionPayment {
+			totalArrecadado += len(rec.TokenIDs) * TokenCreditAmount
+		} else if strings.HasPrefix(rec.Type, "TOKEN_MINT") {
+			emissoes++
+		}
+	}
+	ledgerMutex.RUnlock()
+	
+	payload := map[string]string{
+		"total_arrecadado": strconv.Itoa(totalArrecadado),
+		"emissoes": strconv.Itoa(emissoes),
+	}
+	json.NewEncoder(conn).Encode(Message{Type: MsgRevenueRep, Payload: payload})
+}
+
+func handleLedgerGlobalReq(msg Message, conn net.Conn) {
+	limit := 50
+	if msg.Payload != nil {
+		if s, ok := msg.Payload["limit"]; ok {
+			if v, err := strconv.Atoi(s); err == nil && v > 0 {
+				limit = v
+			}
+		}
+	}
+	sendLedgerRep(conn, "", limit)
+}
+
+func handleSpentTokensReq(msg Message, conn net.Conn) {
+	companyID := msg.CompanyID
+	if companyID == "" && msg.Payload != nil {
+		companyID = msg.Payload["company_id"]
+	}
+	
+	ledgerMutex.RLock()
+	var spent []Token
+	var active []Token
+	for _, tid := range companyTokens[companyID] {
+		if tok, ok := ledgerTokens[tid]; ok {
+			if tok.Status == TokenSpent {
+				spent = append(spent, *tok)
+			} else if tok.Status == TokenActive {
+				active = append(active, *tok)
+			}
+		}
+	}
+	for tid := range spentTokenIDs {
+		if tok, ok := ledgerTokens[tid]; ok && tok.OwnerID == companyID {
+			// fallback check
+			found := false
+			for _, s := range spent {
+				if s.TokenID == tid { found = true; break }
+			}
+			if !found { spent = append(spent, *tok) }
+		}
+	}
+	ledgerMutex.RUnlock()
+	
+	payload := map[string]string{
+		"company_id": companyID,
+		"spent_count": strconv.Itoa(len(spent)),
+		"spent_credits": strconv.Itoa(len(spent) * TokenCreditAmount),
+		"active_count": strconv.Itoa(len(active)),
+		"active_credits": strconv.Itoa(len(active) * TokenCreditAmount),
+	}
+	
+	json.NewEncoder(conn).Encode(Message{Type: MsgSpentTokensRep, Payload: payload})
+}

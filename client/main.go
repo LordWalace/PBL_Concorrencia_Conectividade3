@@ -2,38 +2,58 @@ package main
 
 import (
 	"bufio"
+	"context"
+	crand "crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
+	"math/big"
 	"math/rand"
 	"net"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 type Message struct {
-	Type       string            `json:"type"`
-	RequestID  string            `json:"request_id,omitempty"`
-	Priority   int               `json:"priority,omitempty"`
-	Occurrence string            `json:"occurrence,omitempty"`
-	CompanyID  string            `json:"company_id,omitempty"`
-	MissionID  string            `json:"mission_id,omitempty"`
-	Content    string            `json:"content,omitempty"`
-	Status     string            `json:"status,omitempty"`
-	Payload    map[string]string `json:"payload,omitempty"`
-	Queue      []QueueItem       `json:"queue,omitempty"`
+	Type        string            `json:"type"`
+	DroneID     string            `json:"drone_id,omitempty"`
+	GatewayID   string            `json:"gateway_id,omitempty"`
+	RequestID   string            `json:"request_id,omitempty"`
+	Priority    int               `json:"priority,omitempty"`
+	Lamport     int               `json:"lamport,omitempty"`
+	Timestamp   int64             `json:"timestamp,omitempty"`
+	Payload     map[string]string `json:"payload,omitempty"`
+	Content     string            `json:"content,omitempty"`
+	Status      string            `json:"status,omitempty"`
+	MissionInfo string            `json:"mission_info,omitempty"`
+	Occurrence  string            `json:"occurrence,omitempty"`
+	CompanyID   string            `json:"company_id,omitempty"`
+	MissionID   string            `json:"mission_id,omitempty"`
+	Queue       []AlertRequest    `json:"queue,omitempty"`
 }
 
-type QueueItem struct {
-	RequestID  string `json:"request_id"`
-	Occurrence string `json:"occurrence"`
-	Priority   int    `json:"priority"`
-	GatewayID  string `json:"gateway_id"`
-	Timestamp  int64  `json:"timestamp"`
+type AlertRequest struct {
+	RequestID          string `json:"request_id"`
+	Occurrence         string `json:"occurrence"`
+	Priority           int    `json:"priority"`
+	Lamport            int    `json:"lamport"`
+	GatewayID          string `json:"gateway_id"`
+	Timestamp          int64  `json:"timestamp"`
+	RetryCount         int    `json:"retry_count,omitempty"`
+	SuspendedUntilUnix int64  `json:"suspended_until,omitempty"`
+	CompanyID          string `json:"company_id,omitempty"`
+	MissionID          string `json:"mission_id,omitempty"`
+	AwaitingCredits    bool   `json:"awaiting_credits,omitempty"`
 }
 
 type DroneInfo struct {
@@ -72,7 +92,7 @@ func mustEnv(key string) string {
 
 func getAvailableGatewayConn(gateways map[string]string) (net.Conn, string, error) {
 	for name, addr := range gateways {
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		conn, err := dialTransport(addr, 3*time.Second)
 		if err == nil {
 			return conn, name, nil
 		}
@@ -112,8 +132,6 @@ func main() {
 		fmt.Println("1 - Injetar Alerta Manual")
 		fmt.Println("2 - Ver Status do Estreito")
 		fmt.Println("3 - Ver Log de Eventos")
-		fmt.Println("4 - Consultar Arrecadação (Consórcio Hormuz)")
-		fmt.Println("5 - Histórico do Ledger")
 		fmt.Println("0 - Sair")
 		fmt.Print("Escolha uma opção (ou Enter para atualizar): ")
 
@@ -134,18 +152,6 @@ func main() {
 		case "3":
 			clearScreen()
 			viewEventLog(reader, sectors, gateways)
-			fmt.Println()
-			skipNextClear = true
-
-		case "4":
-			clearScreen()
-			viewHormuzRevenue(reader, gateways)
-			fmt.Println()
-			skipNextClear = true
-
-		case "5":
-			clearScreen()
-			viewLedgerHistory(reader, gateways)
 			fmt.Println()
 			skipNextClear = true
 
@@ -204,6 +210,7 @@ func sendManualAlert(reader *bufio.Reader, sectors []string, gateways map[string
 	sendWithFallback(msg, setorEscolhido, sectors, gateways)
 }
 
+
 func printStatus(sectors []string, gateways map[string]string) {
 	fmt.Println("--- STATUS DO ESTREITO ---")
 
@@ -217,7 +224,7 @@ func printStatus(sectors []string, gateways map[string]string) {
 		go func(idx int, setor string) {
 			defer wg.Done()
 			addr := gateways[setor]
-			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			conn, err := dialTransport(addr, 2*time.Second)
 			if err != nil {
 				sectorResults[idx] = fmt.Sprintf("[Setor %s] OFFLINE", setor)
 				return
@@ -375,114 +382,6 @@ func printStatus(sectors []string, gateways map[string]string) {
 	bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
-// viewHormuzRevenue varre o ledger distribuído em busca de todos os pagamentos e soma o montante arrecadado.
-func viewHormuzRevenue(reader *bufio.Reader, gateways map[string]string) {
-	fmt.Println("--- ARRECADAÇÃO (CONSÓRCIO HORMUZ) ---")
-	fmt.Println("Conectando ao Ledger da malha...")
-
-	conn, _, err := getAvailableGatewayConn(gateways)
-	if err != nil {
-		fmt.Println("\n[ERRO] Toda a malha está offline.")
-		reader.ReadString('\n')
-		return
-	}
-	defer conn.Close()
-
-	// Pede um limite alto para varrer todo o histórico contábil
-	msg := Message{Type: "LEDGER_REQ", Payload: map[string]string{"limit": "1000"}}
-	json.NewEncoder(conn).Encode(msg)
-
-	var reply Message
-	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
-		fmt.Println("\n[ERRO] Falha ao ler resposta do gateway.")
-		reader.ReadString('\n')
-		return
-	}
-
-	var recs []map[string]interface{}
-	json.Unmarshal([]byte(reply.Content), &recs)
-
-	totalArrecadado := 0
-	emissoes := 0
-
-	for _, r := range recs {
-		if t, ok := r["type"].(string); ok {
-			if t == "MISSION_PAYMENT" {
-				// Cada MISSION_PAYMENT tem um campo token_ids com o array de tokens gastos.
-				if tokens, ok := r["token_ids"].([]interface{}); ok {
-					totalArrecadado += len(tokens) * 10 // Cada token vale 10 créditos
-				}
-			} else if strings.HasPrefix(t, "TOKEN_MINT") {
-				emissoes++
-			}
-		}
-	}
-
-	fmt.Println("\n=======================================================")
-	fmt.Printf(" FATURAMENTO TOTAL DO CONSÓRCIO HORMUZ: %d CRÉDITOS\n", totalArrecadado)
-	fmt.Println("=======================================================")
-	fmt.Println("\nℹ️  Todos os créditos descontados das embarcações por")
-	fmt.Println("   acionamentos de emergência foram transferidos para")
-	fmt.Println("   a administração do Estreito.")
-	fmt.Printf("\nEventos de emissão/recarga na malha: %d\n", emissoes)
-
-	fmt.Println("\nPressione Enter para voltar ao menu...")
-	reader.ReadString('\n')
-}
-
-func viewLedgerHistory(reader *bufio.Reader, gateways map[string]string) {
-	fmt.Println("--- HISTÓRICO GERAL DO LIVRO-RAZÃO ---")
-
-	conn, gwName, err := getAvailableGatewayConn(gateways)
-	if err != nil {
-		fmt.Printf("\n[ERRO] %v\n", err)
-		reader.ReadString('\n')
-		return
-	}
-	defer conn.Close()
-
-	msg := Message{Type: "LEDGER_REQ", Payload: map[string]string{"limit": "30"}}
-	json.NewEncoder(conn).Encode(msg)
-
-	var reply Message
-	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
-		fmt.Println("\n[ERRO] Falha ao ler resposta do gateway.")
-		reader.ReadString('\n')
-		return
-	}
-
-	var recs []map[string]interface{}
-	json.Unmarshal([]byte(reply.Content), &recs)
-
-	fmt.Printf("\n[Gateway %s] - Últimos blocos/registros na rede:\n\n", gwName)
-	if len(recs) == 0 {
-		fmt.Println("Nenhum registro encontrado.")
-	} else {
-		for i, r := range recs {
-			t := ""
-			if typeVal, ok := r["type"].(string); ok {
-				t = typeVal
-			}
-			tsVal, _ := r["timestamp"].(float64)
-			date := time.Unix(int64(tsVal), 0).Format("15:04:05")
-
-			compId := ""
-			if c, ok := r["company_id"].(string); ok {
-				compId = c
-			}
-
-			detail := ""
-			if d, ok := r["detail"].(string); ok {
-				detail = d
-			}
-
-			fmt.Printf("%d. [%s] %s | Cia: %s | Detalhe: %s\n", i+1, date, t, compId, detail)
-		}
-	}
-
-	fmt.Println("\nPressione Enter para voltar ao menu...")
-	reader.ReadString('\n')
-}
 
 func viewEventLog(reader *bufio.Reader, sectors []string, gateways map[string]string) {
 	fmt.Println("--- LOG DE EVENTOS ---")
@@ -492,7 +391,7 @@ func viewEventLog(reader *bufio.Reader, sectors []string, gateways map[string]st
 
 	for _, sector := range sectors {
 		addr := gateways[sector]
-		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		conn, err := dialTransport(addr, 2*time.Second)
 		if err != nil {
 			fmt.Printf("[Setor %s] OFFLINE\n", sector)
 			continue
@@ -579,7 +478,7 @@ func sendWithFallback(msg Message, initialSector string, sectors []string, gatew
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		for _, sector := range order {
 			target := gateways[sector]
-			conn, err := net.DialTimeout("tcp", target, 3*time.Second)
+			conn, err := dialTransport(target, 3*time.Second)
 			if err != nil {
 				continue
 			}
@@ -654,6 +553,144 @@ func clearMenuLines(linhas int) {
 	fmt.Printf("\033[%dA\033[J", linhas)
 }
 
+// --- QUIC TRANSPORT ABSTRACTION ---
+
+var useQUIC = os.Getenv("USE_QUIC") == "true"
+
+func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
+	if !useQUIC {
+		return net.DialTimeout("tcp", addr, timeout)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"hormuz-quic"},
+	}
+	conn, err := quic.DialAddr(ctx, addr, tlsConf, nil)
+	if err != nil {
+		return nil, fmt.Errorf("quic dial error: %w", err)
+	}
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		conn.CloseWithError(0, "failed to open stream")
+		return nil, fmt.Errorf("quic stream error: %w", err)
+	}
+	return &quicConnWrapper{Stream: stream, conn: conn}, nil
+}
+
+type transportListener struct {
+	tcpListener  net.Listener
+	quicListener *quic.Listener
+	isQUIC       bool
+	acceptChan   chan net.Conn
+	errChan      chan error
+}
+
+func listenTransport(addr string) (*transportListener, error) {
+	if !useQUIC {
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return &transportListener{tcpListener: l, isQUIC: false}, nil
+	}
+	tlsConf := generateTLSConfig()
+	l, err := quic.ListenAddr(addr, tlsConf, nil)
+	if err != nil {
+		return nil, err
+	}
+	tl := &transportListener{
+		quicListener: l,
+		isQUIC:       true,
+		acceptChan:   make(chan net.Conn),
+		errChan:      make(chan error),
+	}
+	go tl.acceptLoop()
+	return tl, nil
+}
+
+func (tl *transportListener) acceptLoop() {
+	for {
+		conn, err := tl.quicListener.Accept(context.Background())
+		if err != nil {
+			tl.errChan <- err
+			return
+		}
+		go func(c quic.Connection) {
+			for {
+				stream, err := c.AcceptStream(context.Background())
+				if err != nil {
+					return
+				}
+				tl.acceptChan <- &quicConnWrapper{Stream: stream, conn: c}
+			}
+		}(conn)
+	}
+}
+
+func (tl *transportListener) Accept() (net.Conn, error) {
+	if !tl.isQUIC {
+		return tl.tcpListener.Accept()
+	}
+	select {
+	case conn := <-tl.acceptChan:
+		return conn, nil
+	case err := <-tl.errChan:
+		return nil, err
+	}
+}
+
+func (tl *transportListener) Close() error {
+	if !tl.isQUIC {
+		return tl.tcpListener.Close()
+	}
+	return tl.quicListener.Close()
+}
+
+func (tl *transportListener) Addr() net.Addr {
+	if !tl.isQUIC {
+		return tl.tcpListener.Addr()
+	}
+	return tl.quicListener.Addr()
+}
+
+type quicConnWrapper struct {
+	quic.Stream
+	conn quic.Connection
+}
+
+func (w *quicConnWrapper) LocalAddr() net.Addr  { return w.conn.LocalAddr() }
+func (w *quicConnWrapper) RemoteAddr() net.Addr { return w.conn.RemoteAddr() }
+func (w *quicConnWrapper) Close() error         { return w.Stream.Close() }
+
+func generateTLSConfig() *tls.Config {
+	key, err := rsa.GenerateKey(crand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"Hormuz"}},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	certDER, err := x509.CreateCertificate(crand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"hormuz-quic"}}
+}
+
 /******************************************************************************************
 
 Autor: Walace de Jesus Venas
@@ -667,3 +704,4 @@ do código, e estou ciente que estes trechos não serão considerados para fins 
 Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-Agrawala.
 
 *******************************************************************************************/
+
