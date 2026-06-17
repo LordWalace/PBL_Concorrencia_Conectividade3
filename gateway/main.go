@@ -347,34 +347,6 @@ func ensureRequestID(msg *Message) {
 	}
 }
 
-func enqueueAlert(msg Message) {
-	stateMutex.Lock()
-	defer stateMutex.Unlock()
-	if msg.GatewayID == "" {
-		msg.GatewayID = gatewayID
-	}
-	ensureRequestID(&msg)
-	if isRequestClaimed(msg.RequestID) {
-		return
-	}
-	seenAlerts[msg.RequestID] = true
-	req := &AlertRequest{
-		RequestID:  msg.RequestID,
-		Occurrence: msg.Occurrence,
-		Priority:   msg.Priority,
-		Lamport:    tickLamport(msg.Lamport),
-		GatewayID:  msg.GatewayID,
-		Timestamp:  time.Now().Unix(),
-	}
-	heap.Push(&reqQueue, req)
-	notifyQueueProcessor()
-	logEvent(fmt.Sprintf("[R-A] Alerta enfileirado: %s prior. %d", req.Occurrence, req.Priority))
-	log.Printf("[GATEWAY/%s] [R-A] Alerta enfileirado: %s prioridade %d", gatewayID, req.Occurrence, req.Priority)
-	if msg.GatewayID == gatewayID {
-		broadcastPeerMsg(msg)
-	}
-}
-
 func enqueueAlertFromPeer(req AlertRequest) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -498,6 +470,11 @@ func handlePeerConnection(conn net.Conn) {
 		handleRARelease(msg)
 		sendPeerAck(conn, msg)
 	case MsgAlert:
+		if msg.CompanyID == "" {
+			logEvent(fmt.Sprintf("[AMBIENTAL/PEER] Alerta recebido de %s: %s (Prioridade: %d)", msg.GatewayID, msg.Occurrence, msg.Priority))
+			sendPeerAck(conn, msg)
+			return
+		}
 		req := AlertRequest{
 			RequestID:  msg.RequestID,
 			Occurrence: msg.Occurrence,
@@ -550,7 +527,12 @@ func handleRegConnection(conn net.Conn) {
 		if msg.CompanyID != "" {
 			go submitMissionRequest(msg)
 		} else {
-			enqueueAlert(msg)
+			logEvent(fmt.Sprintf("[AMBIENTAL] Alerta detectado pelo sensor: %s (Prioridade: %d)", msg.Occurrence, msg.Priority))
+			log.Printf("[GATEWAY/%s] [AMBIENTAL] Alerta ignorado para despacho: %s", gatewayID, msg.Occurrence)
+			if msg.GatewayID == gatewayID {
+				broadcastPeerMsg(msg)
+				go autoSubmitSectorProblem(msg)
+			}
 		}
 	case MsgMissionEvent:
 		recordMissionEvent(msg)
@@ -1307,12 +1289,18 @@ func receiveStateSync(msg Message) {
 			continue
 		}
 		remainder := strings.TrimPrefix(key, "drone_")
-		last := strings.LastIndex(remainder, "_")
-		if last <= 0 {
+		var droneID, field string
+		for _, f := range []string{"status", "gateway_atual", "control_addr", "mission_active", "mission_info", "ultimo_heartbeat", "ultima_atualizacao", "setor_base"} {
+			if strings.HasSuffix(remainder, "_" + f) {
+				droneID = strings.TrimSuffix(remainder, "_" + f)
+				field = f
+				break
+			}
+		}
+		if droneID == "" {
 			continue
 		}
-		droneID := remainder[:last]
-		field := remainder[last+1:]
+
 		drone, ok := drones[droneID]
 		if !ok {
 			drone = &DroneState{ID: droneID}
@@ -1828,6 +1816,44 @@ func mintTokens(companyID string, count int, recordType, mintRoundID, detail str
 		MintRoundID: mintRoundID,
 	}
 	return created, rec
+}
+
+func companyForSector(setor string) string {
+	switch strings.ToLower(setor) {
+	case "norte":
+		return "navio-norte"
+	case "sul":
+		return "navio-sul"
+	case "leste":
+		return "navio-leste"
+	case "oeste":
+		return "navio-oeste"
+	}
+	return ""
+}
+
+func autoSubmitSectorProblem(originalMsg Message) {
+	companyID := companyForSector(originalMsg.GatewayID)
+	if companyID == "" {
+		log.Printf("[GATEWAY/%s] [AUTO-DISPATCH] Setor desconhecido '%s', ignorando contratação automática", gatewayID, originalMsg.GatewayID)
+		return
+	}
+
+	msg := originalMsg
+	msg.CompanyID = companyID
+	if msg.RequestID == "" {
+		msg.RequestID = fmt.Sprintf("auto:%s:%d", originalMsg.GatewayID, time.Now().UnixNano())
+	}
+
+	log.Printf("[GATEWAY/%s] [AUTO-DISPATCH] Iniciando contratação automática para %s (empresa pagadora: %s)", gatewayID, originalMsg.Occurrence, companyID)
+
+	res := submitMissionRequest(msg)
+
+	if res.Accepted {
+		log.Printf("[GATEWAY/%s] [AUTO-DISPATCH] Sucesso: Missão %s contratada automaticamente por %s", gatewayID, res.MissionID, companyID)
+	} else {
+		log.Printf("[GATEWAY/%s] [AUTO-DISPATCH] Falha na contratação automática por %s: %s", gatewayID, companyID, res.Reason)
+	}
 }
 
 func activeTokenCount(companyID string) int {

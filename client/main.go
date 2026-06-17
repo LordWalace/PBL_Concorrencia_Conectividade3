@@ -81,7 +81,7 @@ var occurrenceOptions = []OccurrenceOption{
 }
 
 // Navios genéricos usados silenciosamente para movimentar a economia do gateway
-var defaultCompanies = []string{"navio-alpha", "navio-beta", "navio-gamma", "navio-delta"}
+var defaultCompanies = []string{"navio-norte", "navio-sul", "navio-leste", "navio-oeste"}
 
 func mustEnv(key string) string {
 	val := os.Getenv(key)
@@ -106,11 +106,18 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	clientPort := mustEnv("GATEWAY_TCP_CLIENT_PORT")
+	regPort := mustEnv("GATEWAY_TCP_REG_PORT")
 	gateways := map[string]string{
 		"Norte": fmt.Sprintf("%s:%s", mustEnv("IP_NORTE"), clientPort),
 		"Sul":   fmt.Sprintf("%s:%s", mustEnv("IP_SUL"), clientPort),
 		"Leste": fmt.Sprintf("%s:%s", mustEnv("IP_LESTE"), clientPort),
 		"Oeste": fmt.Sprintf("%s:%s", mustEnv("IP_OESTE"), clientPort),
+	}
+	gatewaysReg := map[string]string{
+		"Norte": fmt.Sprintf("%s:%s", mustEnv("IP_NORTE"), regPort),
+		"Sul":   fmt.Sprintf("%s:%s", mustEnv("IP_SUL"), regPort),
+		"Leste": fmt.Sprintf("%s:%s", mustEnv("IP_LESTE"), regPort),
+		"Oeste": fmt.Sprintf("%s:%s", mustEnv("IP_OESTE"), regPort),
 	}
 
 	reader := bufio.NewReader(os.Stdin)
@@ -130,9 +137,10 @@ func main() {
 		fmt.Println("  DESBLOQUEIO DO ESTREITO HORMUZ")
 		fmt.Println("======================================")
 		fmt.Println("\nMenu:")
-		fmt.Println("1 - Injetar Alerta Manual")
-		fmt.Println("2 - Ver Status do Estreito")
-		fmt.Println("3 - Ver Log de Eventos")
+		fmt.Println("1 - Injetar Evento Ambiental (Mock de Sensor/Beacon)")
+		fmt.Println("2 - Acionar Missão de Resgate (Requer Tokens / Cliente)")
+		fmt.Println("3 - Ver Status do Estreito")
+		fmt.Println("4 - Ver Log de Eventos")
 		fmt.Println("0 - Sair")
 		fmt.Print("Escolha uma opção (ou Enter para atualizar): ")
 
@@ -141,23 +149,28 @@ func main() {
 		switch choice {
 		case "1":
 			clearScreen()
-			sendManualAlert(reader, sectors, gateways)
+			sendManualAlert(reader, sectors, gatewaysReg, true)
 			skipNextClear = true
 
 		case "2":
+			clearScreen()
+			sendManualAlert(reader, sectors, gateways, false)
+			skipNextClear = true
+
+		case "3":
 			clearScreen()
 			printStatus(sectors, gateways)
 			fmt.Println()
 			skipNextClear = true
 
-		case "3":
+		case "4":
 			clearScreen()
 			viewEventLog(reader, sectors, gateways)
 			fmt.Println()
 			skipNextClear = true
 
 		case "":
-			clearMenuLines(13)
+			clearMenuLines(14)
 			continue
 
 		case "0":
@@ -172,8 +185,12 @@ func main() {
 	}
 }
 
-func sendManualAlert(reader *bufio.Reader, sectors []string, gateways map[string]string) {
-	fmt.Println("--- INJETAR ALERTA MANUAL ---")
+func sendManualAlert(reader *bufio.Reader, sectors []string, gateways map[string]string, isEnvironmental bool) {
+	if isEnvironmental {
+		fmt.Println("--- INJETAR ALERTA AMBIENTAL (MOCK DE SENSOR) ---")
+	} else {
+		fmt.Println("--- ACIONAR MISSÃO (CLIENTE/PAGADOR) ---")
+	}
 
 	// Setor
 	for i, setor := range sectors {
@@ -192,21 +209,31 @@ func sendManualAlert(reader *bufio.Reader, sectors []string, gateways map[string
 	occurrenceIndex := readNumber(reader, 1, len(occurrenceOptions)) - 1
 	option := occurrenceOptions[occurrenceIndex]
 
-	// Economia invisível: seleciona um navio aleatório para ser cobrado no gateway
-	companyID := defaultCompanies[rand.Intn(len(defaultCompanies))]
 	requestID := fmt.Sprintf("client:%s:%d", setorEscolhido, time.Now().UnixNano())
 
-	msg := Message{
-		Type:       "MISSION_SUBMIT",
-		RequestID:  requestID,
-		Priority:   option.Priority,
-		Occurrence: option.Description,
-		CompanyID:  companyID,
+	var msg Message
+	if isEnvironmental {
+		msg = Message{
+			Type:       "ALERT",
+			RequestID:  requestID,
+			Priority:   option.Priority,
+			Occurrence: option.Description,
+			CompanyID:  "", // Vazio = Evento Ambiental
+		}
+		fmt.Printf("\n[BEACON MOCK] Injetando evento no setor %s...\n", setorEscolhido)
+	} else {
+		companyID := defaultCompanies[rand.Intn(len(defaultCompanies))]
+		msg = Message{
+			Type:       "MISSION_SUBMIT",
+			RequestID:  requestID,
+			Priority:   option.Priority,
+			Occurrence: option.Description,
+			CompanyID:  companyID,
+		}
+		custo := option.Priority * 10
+		fmt.Printf("\n[CLIENTE] Transmitindo alerta para o setor %s...\n", setorEscolhido)
+		fmt.Printf("[ECONOMIA] O navio '%s' pagará %d tokens por este despacho!\n", companyID, custo)
 	}
-
-	custo := option.Priority * 10
-	fmt.Printf("\n[CLIENTE] Transmitindo alerta para o setor %s...\n", setorEscolhido)
-	fmt.Printf("[ECONOMIA] A fatura de %d créditos será processada nos sistemas do Consórcio Hormuz.\n", custo)
 
 	sendWithFallback(msg, setorEscolhido, sectors, gateways)
 }
