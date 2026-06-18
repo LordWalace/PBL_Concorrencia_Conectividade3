@@ -74,10 +74,10 @@ const (
 	DroneBusy      = "OCUPADO"
 	DroneFailed    = "FALHO"
 
-	TokenActive         = "ativo"
-	TokenSpent          = "gasto"
-	TokenCancelled      = "cancelado"
-	TokenCreditAmount   = 10
+	TokenActive             = "ativo"
+	TokenSpent              = "gasto"
+	TokenCancelled          = "cancelado"
+	TokenCreditAmount       = 10
 	LedgerTokenMintInitial  = "TOKEN_MINT_INITIAL"
 	LedgerTokenMintPeriodic = "TOKEN_MINT_PERIODIC"
 	LedgerTokenMintAdmin    = "TOKEN_MINT_ADMIN"
@@ -227,7 +227,6 @@ func nextReadyRequestIndex() int {
 
 var (
 	gatewayID             string
-	gatewayIP             string
 	gatewayHost           string
 	regPort               string
 	clientPort            string
@@ -237,6 +236,7 @@ var (
 	peerIDs               []string
 	peerOfflineUntil      = make(map[string]time.Time)
 	peerFailureCount      = make(map[string]int)
+	peerEverOnline        = make(map[string]bool)
 	pendingPeerMsgs       = make(map[string][]Message)
 	pendingPeerMutex      sync.Mutex
 	stateSynced           bool
@@ -272,7 +272,6 @@ var (
 	creditWaitQueue       PriorityQueue
 	creditWaitMutex       sync.Mutex
 	economyOpPending      = make(chan economyOp, 64)
-	useQUICTransport      = os.Getenv("USE_QUIC") == "true"
 )
 
 func mustEnv(key string) string {
@@ -342,8 +341,6 @@ func removeAlertFromQueue(requestID string) {
 	}
 }
 
-
-
 func ensureRequestID(msg *Message) {
 	if msg.RequestID == "" {
 		msg.RequestID = fmt.Sprintf("%s:%d:%d", gatewayID, time.Now().UnixNano(), tickLamport(msg.Lamport))
@@ -366,7 +363,7 @@ func enqueueAlertFromPeer(req AlertRequest) {
 		return
 	}
 	seenAlerts[req.RequestID] = true
-	
+
 	for i := 0; i < reqQueue.Len(); i++ {
 		if reqQueue[i].RequestID == req.RequestID {
 			reqQueue[i] = &req
@@ -401,14 +398,16 @@ func mergeQueueFromStateSync(queue []AlertRequest) {
 	}
 }
 
-func main() {
-	heap.Init(&reqQueue)
+func init() {
 	gatewayID = mustEnv("GATEWAY_ID")
-	gatewayIP = mustEnv("GATEWAY_IP")
 	gatewayHost = mustEnv("GATEWAY_HOST")
 	regPort = mustEnv("GATEWAY_TCP_REG_PORT")
 	clientPort = mustEnv("GATEWAY_TCP_CLIENT_PORT")
 	peerPort = mustEnv("GATEWAY_TCP_PEER_PORT")
+}
+
+func main() {
+	heap.Init(&reqQueue)
 
 	peerAddrsByID = map[string]string{
 		"Norte": fmt.Sprintf("%s:%s", mustEnv("IP_NORTE"), peerPort),
@@ -425,8 +424,19 @@ func main() {
 		peerIDs = append(peerIDs, id)
 	}
 
-	log.Printf("[GATEWAY/%s] Iniciando gateway em %s", gatewayID, gatewayHost)
-	log.Printf("[GATEWAY/%s] Peers conhecidos: %v", gatewayID, peers)
+	log.Printf("==================================================")
+	log.Printf("[GATEWAY/%s] BIND HOST LOCAL : %s", gatewayID, gatewayHost)
+	log.Printf("[GATEWAY/%s] LISTENER REG    : Porta %s", gatewayID, regPort)
+	log.Printf("[GATEWAY/%s] LISTENER CLIENT : Porta %s", gatewayID, clientPort)
+	log.Printf("[GATEWAY/%s] LISTENER PEER   : Porta %s", gatewayID, peerPort)
+	log.Printf("==================================================")
+	log.Printf("[GATEWAY/%s] PEERS ALVO MAPEADOS:", gatewayID)
+	for id, addr := range peerAddrsByID {
+		if id != gatewayID {
+			log.Printf("   -> %s = %s", id, addr)
+		}
+	}
+	log.Printf("==================================================")
 
 	initEconomy()
 
@@ -453,7 +463,7 @@ func startServer(host, port string, handler func(net.Conn)) {
 	if err != nil {
 		log.Fatalf("[GATEWAY/%s] Falha ao escutar em %s: %v", gatewayID, addr, err)
 	}
-	log.Printf("[GATEWAY/%s] Servidor TCP ativo em %s", gatewayID, addr)
+	log.Printf("[GATEWAY/%s] Servidor QUIC ativo em %s", gatewayID, addr)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -515,8 +525,6 @@ func handlePeerConnection(conn net.Conn) {
 		sendPeerAck(conn, msg)
 	case MsgPeerHeartbeat:
 		sendPeerAck(conn, msg)
-	case MsgPeerHeartbeatAck:
-		markPeerOnline(msg.GatewayID)
 	}
 }
 
@@ -610,6 +618,7 @@ func handleClientConnection(conn net.Conn) {
 			}
 		}
 		sendLedgerRep(conn, companyID, limit)
+
 	case MsgStatusReq:
 		sendStatusRep(conn)
 	case MsgEventsReq:
@@ -713,6 +722,27 @@ func sendStatusRep(conn net.Conn) {
 		}
 		payload[keyPrefix+"ultima_atualizacao"] = fmt.Sprintf("%d", drone.LastUpdate.Unix())
 	}
+
+	var online []string
+	var offline []string
+	for _, pID := range peerIDs {
+		offlineUntil, isOffline := peerOfflineUntil[pID]
+		if isOffline && time.Now().Before(offlineUntil) {
+			offline = append(offline, pID)
+		} else {
+			online = append(online, pID)
+		}
+	}
+	mode := "Standalone"
+	if len(online) == len(peerIDs) && len(peerIDs) > 0 {
+		mode = "Cluster Completo"
+	} else if len(online) > 0 {
+		mode = "Cluster Parcial"
+	}
+	payload["cluster_mode"] = mode
+	payload["peers_online"] = strings.Join(online, ",")
+	payload["peers_offline"] = strings.Join(offline, ",")
+
 	stateMutex.Unlock()
 	queue := queuePreviewItems(4)
 	if err := json.NewEncoder(conn).Encode(Message{Type: MsgStatusRep, Payload: payload, Queue: queue}); err != nil {
@@ -728,9 +758,7 @@ func queuePreviewItems(limit int) []AlertRequest {
 	}
 
 	temp := make(PriorityQueue, reqQueue.Len())
-	for i, req := range reqQueue {
-		temp[i] = req
-	}
+	copy(temp, reqQueue)
 	heap.Init(&temp)
 
 	preview := make([]AlertRequest, 0, limit)
@@ -779,9 +807,7 @@ func queuePreviewItemsOffset(offset, limit int) []AlertRequest {
 	}
 
 	temp := make(PriorityQueue, reqQueue.Len())
-	for i, req := range reqQueue {
-		temp[i] = req
-	}
+	copy(temp, reqQueue)
 	heap.Init(&temp)
 
 	for i := 0; i < offset && temp.Len() > 0; i++ {
@@ -869,8 +895,6 @@ func handleRAReply(msg Message) {
 		}
 	}
 }
-
-
 
 func handleRARelease(msg Message) {
 	stateMutex.Lock()
@@ -1077,7 +1101,7 @@ func waitForReplies(droneID string, msg Message) {
 		select {
 		case <-ch:
 			gotReplies++
-		case <-time.After(1 * time.Second):
+		case <-time.After(10 * time.Second):
 			stateMutex.Lock()
 			peerOfflineUntil[peerID] = time.Now().Add(10 * time.Second)
 			stateMutex.Unlock()
@@ -1253,22 +1277,25 @@ func handleLocalDroneFailure(droneID, reason string) {
 
 func syncStateOnStart() {
 	time.Sleep(2 * time.Second)
-	for _, peerID := range peerIDs {
-		stateMutex.Lock()
-		if time.Now().Before(peerOfflineUntil[peerID]) {
-			stateMutex.Unlock()
-			continue
-		}
-		stateMutex.Unlock()
 
-		if err := syncStateFromPeer(peerID, true); err != nil {
-			log.Printf("[GATEWAY/%s] [SYNC] Falha ao sincronizar com %s: %v", gatewayID, peerID, err)
-			continue
-		}
-		return
+	var wg sync.WaitGroup
+	var syncMutex sync.Mutex
+	syncedPeers := 0
+
+	for _, peerID := range peerIDs {
+		wg.Add(1)
+		go func(pID string) {
+			defer wg.Done()
+			if err := syncStateFromPeer(pID, true); err == nil {
+				syncMutex.Lock()
+				syncedPeers++
+				syncMutex.Unlock()
+			}
+		}(peerID)
 	}
 
-	log.Printf("[GATEWAY/%s] [SYNC] Nenhum peer disponível para sincronizar. Inicializando sem fila replicada.", gatewayID)
+	wg.Wait()
+	log.Printf("[GATEWAY/%s] [SYNC] Inicialização concluída. Conectado a %d/%d peers", gatewayID, syncedPeers, len(peerIDs))
 	markStateReady()
 }
 
@@ -1362,8 +1389,8 @@ func receiveStateSync(msg Message) {
 		remainder := strings.TrimPrefix(key, "drone_")
 		var droneID, field string
 		for _, f := range []string{"status", "gateway_atual", "control_addr", "mission_active", "mission_info", "ultimo_heartbeat", "ultima_atualizacao", "setor_base"} {
-			if strings.HasSuffix(remainder, "_" + f) {
-				droneID = strings.TrimSuffix(remainder, "_" + f)
+			if strings.HasSuffix(remainder, "_"+f) {
+				droneID = strings.TrimSuffix(remainder, "_"+f)
 				field = f
 				break
 			}
@@ -1447,13 +1474,14 @@ func monitorLocalDroneHeartbeats() {
 	}
 }
 
-
-
 func markPeerOffline(peerID string, duration time.Duration, reason string) {
 	stateMutex.Lock()
 	peerOfflineUntil[peerID] = time.Now().Add(duration)
+	wasEverOnline := peerEverOnline[peerID]
 	stateMutex.Unlock()
-	log.Printf("[GATEWAY/%s] [PEER] Marcando peer %s offline por %s: %s", gatewayID, peerID, duration, reason)
+	if wasEverOnline {
+		log.Printf("[GATEWAY/%s] [PEER] Marcando peer %s offline por %s: %s", gatewayID, peerID, duration, reason)
+	}
 }
 
 func enqueuePendingPeerMessage(peerID string, msg Message) {
@@ -1476,8 +1504,6 @@ func sendPendingPeerMessages(peerID string) {
 		}
 	}
 }
-
-
 
 func broadcastPeerMsg(msg Message) {
 	for _, peerID := range peerIDs {
@@ -1514,7 +1540,7 @@ func sendDirectOnce(targetGateway string, msg Message) error {
 	}
 	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(1 * time.Second))
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := json.NewEncoder(conn).Encode(msg); err != nil {
 		return err
 	}
@@ -1539,17 +1565,17 @@ func sendDirectWithRetry(targetGateway string, msg Message, maxAttempts int) err
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		conn, err := dialTransport(addr, 2*time.Second)
+		conn, err := dialTransport(addr, 5*time.Second)
 		if err != nil {
 			lastErr = err
-			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 			continue
 		}
-		conn.SetDeadline(time.Now().Add(4 * time.Second))
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := json.NewEncoder(conn).Encode(msg); err != nil {
 			conn.Close()
 			lastErr = err
-			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 			continue
 		}
 		if shouldPeerAck(msg.Type) {
@@ -1557,13 +1583,13 @@ func sendDirectWithRetry(targetGateway string, msg Message, maxAttempts int) err
 			if err := json.NewDecoder(conn).Decode(&ack); err != nil {
 				conn.Close()
 				lastErr = err
-				time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 				continue
 			}
 			if ack.Type != MsgAck || ack.Status != "OK" {
 				conn.Close()
 				lastErr = fmt.Errorf("ack inválido do peer %s: %s", targetGateway, ack.Type)
-				time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 				continue
 			}
 		}
@@ -1595,8 +1621,14 @@ func markPeerOnline(peerID string) {
 	_, wasOffline := peerOfflineUntil[peerID]
 	delete(peerOfflineUntil, peerID)
 	peerFailureCount[peerID] = 0
+	wasEverOnline := peerEverOnline[peerID]
+	peerEverOnline[peerID] = true
 	stateMutex.Unlock()
-	log.Printf("[GATEWAY/%s] [PEER] Peer %s online", gatewayID, peerID)
+	if !wasEverOnline {
+		log.Printf("[GATEWAY/%s] [PEER] Peer %s encontrado na malha pela primeira vez!", gatewayID, peerID)
+	} else if wasOffline {
+		log.Printf("[GATEWAY/%s] [PEER] Peer %s reconectado e online", gatewayID, peerID)
+	}
 	go sendPendingPeerMessages(peerID)
 	if wasOffline {
 		go syncStateFromPeer(peerID, false)
@@ -1639,8 +1671,6 @@ func startPeerHealthMonitor() {
 		}
 	}
 }
-
-
 
 func getReplyChannel(droneID, peerID string) chan struct{} {
 	replyChannelMutex.Lock()
@@ -1685,11 +1715,10 @@ func logEvent(event string) {
 	eventLog = append(eventLog, fmt.Sprintf("%s %s", time.Now().Format(time.RFC3339), event))
 }
 
-
 // --- LEDGER / ECONOMY / TRANSPORT ---
 
 func dialPeerTransport(addr string) (net.Conn, error) {
-	return dialTransport(addr, 2*time.Second)
+	return dialTransport(addr, 5*time.Second) // Longer timeout for QUIC handshake over local Docker network
 }
 
 func ledgerFilePath() string {
@@ -1702,10 +1731,10 @@ func loadLedgerFromDisk() {
 		return
 	}
 	var saved struct {
-		Records  []LedgerRecord    `json:"records"`
-		Tokens   map[string]*Token `json:"tokens"`
-		Companies map[string]*Company `json:"companies"`
-		MintRounds map[string]bool `json:"mint_rounds"`
+		Records    []LedgerRecord      `json:"records"`
+		Tokens     map[string]*Token   `json:"tokens"`
+		Companies  map[string]*Company `json:"companies"`
+		MintRounds map[string]bool     `json:"mint_rounds"`
 	}
 	if err := json.Unmarshal(data, &saved); err != nil {
 		log.Printf("[GATEWAY/%s] [LEDGER] Falha ao carregar ledger: %v", gatewayID, err)
@@ -1744,14 +1773,14 @@ func validateLedgerRecords(records []LedgerRecord) error {
 		if rec.PreviousHash != expectedPrevHash {
 			return fmt.Errorf("quebra na cadeia: registro %s esperava prev_hash %s, mas tem %s", rec.RecordID, expectedPrevHash, rec.PreviousHash)
 		}
-		
+
 		// Recalcula o hash do payload + previousHash
 		payloadBytes, _ := json.Marshal(rec)
 		// Precisamos simular o payload original sem o Hash
 		copyRec := rec
 		copyRec.Hash = ""
 		payloadCopy, _ := json.Marshal(copyRec)
-		
+
 		computedHash := hashLedgerPayload(string(payloadCopy) + rec.PreviousHash)
 		if rec.Hash != computedHash && rec.Hash != hashLedgerPayload(string(payloadBytes)+rec.PreviousHash) {
 			// Alguns hashes antigos podem ter sido computados de formas ligeiramente diferentes,
@@ -1760,7 +1789,7 @@ func validateLedgerRecords(records []LedgerRecord) error {
 			// Vamos simplificar forçando um check estrito:
 			// return fmt.Errorf("hash adulterado no registro %s: esperado %s, atual %s", rec.RecordID, computedHash, rec.Hash)
 		}
-		
+
 		// Verificação simplificada para a auditoria:
 		if rec.Hash == "" {
 			return fmt.Errorf("hash vazio no registro %s", rec.RecordID)
@@ -1771,33 +1800,33 @@ func validateLedgerRecords(records []LedgerRecord) error {
 
 func persistLedgerToDisk() {
 	ledgerMutex.RLock()
-	
+
 	recs := append([]LedgerRecord(nil), ledgerRecords...)
-	
+
 	toks := make(map[string]*Token, len(ledgerTokens))
 	for k, v := range ledgerTokens {
 		copyTok := *v
 		toks[k] = &copyTok
 	}
-	
+
 	comps := make(map[string]*Company, len(companies))
 	for k, v := range companies {
 		copyC := *v
 		comps[k] = &copyC
 	}
-	
+
 	rounds := make(map[string]bool, len(mintRoundsDone))
 	for k, v := range mintRoundsDone {
 		rounds[k] = v
 	}
-	
+
 	ledgerMutex.RUnlock()
 
 	snapshot := struct {
-		Records    []LedgerRecord    `json:"records"`
-		Tokens     map[string]*Token `json:"tokens"`
+		Records    []LedgerRecord      `json:"records"`
+		Tokens     map[string]*Token   `json:"tokens"`
 		Companies  map[string]*Company `json:"companies"`
-		MintRounds map[string]bool   `json:"mint_rounds"`
+		MintRounds map[string]bool     `json:"mint_rounds"`
 	}{
 		Records:    recs,
 		Tokens:     toks,
@@ -1829,8 +1858,6 @@ func rebuildCompanyTokenIndexLocked() {
 		}
 	}
 }
-
-
 
 func hashLedgerPayload(payload string) string {
 	sum := sha256.Sum256([]byte(payload))
@@ -1896,7 +1923,7 @@ func companyInConsortium(companyID string) bool {
 func mintTokens(companyID string, count int, recordType, mintRoundID, detail string) ([]*Token, LedgerRecord) {
 	ledgerMutex.Lock()
 	defer ledgerMutex.Unlock()
-	
+
 	txID := fmt.Sprintf("tx-%s-%d", companyID, time.Now().UnixNano())
 	created := make([]*Token, 0, count)
 	tokenIDs := make([]string, 0, count)
@@ -2028,8 +2055,6 @@ func removeTokenFromCompanyIndexLocked(companyID, tokenID string) {
 		}
 	}
 }
-
-
 
 func tokensCostForPriority(priority int) int {
 	if priority < 1 {
@@ -2266,7 +2291,12 @@ func executePeriodicMint() {
 }
 
 func startPeriodicMintLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
+	intervalStr := os.Getenv("MINT_INTERVAL_SECONDS")
+	intervalSecs, err := strconv.Atoi(intervalStr)
+	if err != nil || intervalSecs <= 0 {
+		intervalSecs = 300 // fallback para 5 minutos
+	}
+	ticker := time.NewTicker(time.Duration(intervalSecs) * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		executePeriodicMint()
@@ -2474,7 +2504,7 @@ func handleTokenTransfer(msg Message, conn net.Conn) {
 	fromCompany := msg.CompanyID
 	var toCompany string
 	var amount int
-	
+
 	if msg.Payload != nil {
 		if fromCompany == "" {
 			fromCompany = msg.Payload["from_company"]
@@ -2482,7 +2512,7 @@ func handleTokenTransfer(msg Message, conn net.Conn) {
 		toCompany = msg.Payload["to_company"]
 		amount, _ = strconv.Atoi(msg.Payload["amount"])
 	}
-	
+
 	if fromCompany == "" || toCompany == "" || amount <= 0 {
 		json.NewEncoder(conn).Encode(Message{Type: "TOKEN_TRANSFER_ACK", Status: "DENIED", Content: "Dados inválidos"})
 		return
@@ -2497,10 +2527,10 @@ func handleTokenTransfer(msg Message, conn net.Conn) {
 		if !ok {
 			return // Saldo insuficiente
 		}
-		
+
 		txID := fmt.Sprintf("transfer-%s-%s-%d", fromCompany, toCompany, time.Now().UnixNano())
 		spentIDs := spendTokens(tokens, txID, "")
-		
+
 		// Grava o débito
 		transferOutRec := appendLedgerRecord(LedgerRecord{
 			Type:      "TOKEN_TRANSFER_OUT",
@@ -2511,13 +2541,13 @@ func handleTokenTransfer(msg Message, conn net.Conn) {
 			Detail:    fmt.Sprintf("transferência de %d tokens para %s", amount, toCompany),
 		})
 		replicateLedgerRecord(transferOutRec)
-		
+
 		// Grava o crédito/novos tokens para ToCompany
 		_, transferInRec := mintTokens(toCompany, amount, "TOKEN_TRANSFER_IN", "", fmt.Sprintf("recebimento de %d tokens de %s", amount, fromCompany))
 		transferInRec.TxID = txID
 		fullIn := appendLedgerRecord(transferInRec)
 		replicateLedgerRecord(fullIn)
-		
+
 		success = true
 	})
 
@@ -2527,8 +2557,6 @@ func handleTokenTransfer(msg Message, conn net.Conn) {
 		json.NewEncoder(conn).Encode(Message{Type: "TOKEN_TRANSFER_ACK", Status: "DENIED", Content: "Saldo insuficiente"})
 	}
 }
-
-
 
 func reprocessCreditWaitForCompany(companyID string) {
 	creditWaitMutex.Lock()
@@ -2636,54 +2664,86 @@ Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-
 
 // --- QUIC TRANSPORT ABSTRACTION ---
 
-var useQUIC = os.Getenv("USE_QUIC") == "true"
+var (
+	quicConns = make(map[string]quic.Connection)
+	quicMutex sync.Mutex
+)
 
-func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
-	if !useQUIC {
-		return net.DialTimeout("tcp", addr, timeout)
+func getQuicConnection(addr string, timeout time.Duration) (quic.Connection, error) {
+	quicMutex.Lock()
+	defer quicMutex.Unlock()
+
+	if conn, ok := quicConns[addr]; ok {
+		return conn, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"hormuz-quic"},
 	}
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	quicConfig := &quic.Config{
+		KeepAlivePeriod: 10 * time.Second,
+	}
+
+	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConfig)
 	if err != nil {
 		return nil, fmt.Errorf("quic dial error: %w", err)
 	}
+
+	quicConns[addr] = conn
+	return conn, nil
+}
+
+func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
+	conn, err := getQuicConnection(addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		conn.CloseWithError(0, "failed to open stream")
-		return nil, fmt.Errorf("quic stream error: %w", err)
+		quicMutex.Lock()
+		delete(quicConns, addr)
+		quicMutex.Unlock()
+
+		conn, err = getQuicConnection(addr, timeout)
+		if err != nil {
+			return nil, err
+		}
+
+		ctx2, cancel2 := context.WithTimeout(context.Background(), timeout)
+		defer cancel2()
+		stream, err = conn.OpenStreamSync(ctx2)
+		if err != nil {
+			return nil, fmt.Errorf("quic stream error após reconexão: %w", err)
+		}
 	}
+
 	return &quicConnWrapper{Stream: stream, conn: conn}, nil
 }
 
 type transportListener struct {
-	tcpListener  net.Listener
 	quicListener *quic.Listener
-	isQUIC       bool
 	acceptChan   chan net.Conn
 	errChan      chan error
 }
 
 func listenTransport(addr string) (*transportListener, error) {
-	if !useQUIC {
-		l, err := net.Listen("tcp", addr)
-		if err != nil {
-			return nil, err
-		}
-		return &transportListener{tcpListener: l, isQUIC: false}, nil
-	}
 	tlsConf := generateTLSConfig()
 	l, err := quic.ListenAddr(addr, tlsConf, nil)
 	if err != nil {
 		return nil, err
 	}
+	log.Printf("[QUIC] Listener aberto com sucesso na porta: %s", addr)
 	tl := &transportListener{
 		quicListener: l,
-		isQUIC:       true,
 		acceptChan:   make(chan net.Conn),
 		errChan:      make(chan error),
 	}
@@ -2711,9 +2771,6 @@ func (tl *transportListener) acceptLoop() {
 }
 
 func (tl *transportListener) Accept() (net.Conn, error) {
-	if !tl.isQUIC {
-		return tl.tcpListener.Accept()
-	}
 	select {
 	case conn := <-tl.acceptChan:
 		return conn, nil
@@ -2723,16 +2780,10 @@ func (tl *transportListener) Accept() (net.Conn, error) {
 }
 
 func (tl *transportListener) Close() error {
-	if !tl.isQUIC {
-		return tl.tcpListener.Close()
-	}
 	return tl.quicListener.Close()
 }
 
 func (tl *transportListener) Addr() net.Addr {
-	if !tl.isQUIC {
-		return tl.tcpListener.Addr()
-	}
 	return tl.quicListener.Addr()
 }
 
@@ -2818,8 +2869,8 @@ func handleAdminCredit(msg Message, conn net.Conn) {
 		replicateLedgerRecord(full)
 		log.Printf("[GATEWAY/%s] [ADMIN] Credito manual: %s recebeu %d creditos", gatewayID, companyID, tokensToMint*TokenCreditAmount)
 		json.NewEncoder(conn).Encode(Message{
-			Type: MsgAdminCreditAck, 
-			Status: "OK", 
+			Type:    MsgAdminCreditAck,
+			Status:  "OK",
 			Content: fmt.Sprintf("Emitidos %d creditos para %s", len(created)*TokenCreditAmount, companyID),
 		})
 	})
@@ -2837,10 +2888,10 @@ func handleRevenueReq(msg Message, conn net.Conn) {
 		}
 	}
 	ledgerMutex.RUnlock()
-	
+
 	payload := map[string]string{
 		"total_arrecadado": strconv.Itoa(totalArrecadado),
-		"emissoes": strconv.Itoa(emissoes),
+		"emissoes":         strconv.Itoa(emissoes),
 	}
 	json.NewEncoder(conn).Encode(Message{Type: MsgRevenueRep, Payload: payload})
 }
@@ -2862,7 +2913,7 @@ func handleSpentTokensReq(msg Message, conn net.Conn) {
 	if companyID == "" && msg.Payload != nil {
 		companyID = msg.Payload["company_id"]
 	}
-	
+
 	ledgerMutex.RLock()
 	var spent []Token
 	var active []Token
@@ -2880,20 +2931,25 @@ func handleSpentTokensReq(msg Message, conn net.Conn) {
 			// fallback check
 			found := false
 			for _, s := range spent {
-				if s.TokenID == tid { found = true; break }
+				if s.TokenID == tid {
+					found = true
+					break
+				}
 			}
-			if !found { spent = append(spent, *tok) }
+			if !found {
+				spent = append(spent, *tok)
+			}
 		}
 	}
 	ledgerMutex.RUnlock()
-	
+
 	payload := map[string]string{
-		"company_id": companyID,
-		"spent_count": strconv.Itoa(len(spent)),
-		"spent_credits": strconv.Itoa(len(spent) * TokenCreditAmount),
-		"active_count": strconv.Itoa(len(active)),
+		"company_id":     companyID,
+		"spent_count":    strconv.Itoa(len(spent)),
+		"spent_credits":  strconv.Itoa(len(spent) * TokenCreditAmount),
+		"active_count":   strconv.Itoa(len(active)),
 		"active_credits": strconv.Itoa(len(active) * TokenCreditAmount),
 	}
-	
+
 	json.NewEncoder(conn).Encode(Message{Type: MsgSpentTokensRep, Payload: payload})
 }

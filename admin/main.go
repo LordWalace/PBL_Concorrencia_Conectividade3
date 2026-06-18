@@ -479,12 +479,7 @@ func clearMenuLines(linhas int) {
 
 // --- QUIC TRANSPORT ABSTRACTION ---
 
-var useQUIC = os.Getenv("USE_QUIC") == "true"
-
 func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
-	if !useQUIC {
-		return net.DialTimeout("tcp", addr, timeout)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	tlsConf := &tls.Config{

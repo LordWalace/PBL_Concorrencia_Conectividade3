@@ -230,53 +230,53 @@ func solveProblemMenu(reader *bufio.Reader, gateways map[string]string) {
 	for {
 		clearScreen()
 		fmt.Println("--- RESOLVER PROBLEMA EXISTENTE ---")
-		
-		conn, sector, err := getAvailableGatewayConn(gateways)
+
+		conn, _, err := getAvailableGatewayConn(gateways)
 		if err != nil {
 			fmt.Println("Nenhum gateway disponível para consultar problemas.")
 			fmt.Println("\nPressione Enter para voltar...")
 			reader.ReadString('\n')
 			return
 		}
-		
+
 		req := Message{
 			Type: "PROBLEMS_REQ",
 			Payload: map[string]string{
 				"offset": strconv.Itoa(offset),
-				"limit": strconv.Itoa(limit),
+				"limit":  strconv.Itoa(limit),
 			},
 		}
 		json.NewEncoder(conn).Encode(req)
-		
-		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 		var rep Message
 		err = json.NewDecoder(conn).Decode(&rep)
 		conn.Close()
-		
+
 		if err != nil || rep.Type != "PROBLEMS_REP" {
 			fmt.Println("Erro ao buscar problemas no gateway.")
 			fmt.Println("\nPressione Enter para voltar...")
 			reader.ReadString('\n')
 			return
 		}
-		
+
 		total, _ := strconv.Atoi(rep.Payload["total"])
-		
+
 		if total == 0 {
 			fmt.Println("Nenhum problema pendente no Estreito.")
 			fmt.Println("\nPressione Enter para voltar...")
 			reader.ReadString('\n')
 			return
 		}
-		
+
 		fmt.Printf("Problemas pendentes (%d encontrados, exibindo paginacao):\n\n", total)
 		for i, p := range rep.Queue {
 			fmt.Printf("%d - %s (Prioridade: %d, Origem: %s)\n", i+1, p.Occurrence, p.Priority, p.GatewayID)
 		}
-		
-		hasNext := offset + len(rep.Queue) < total
+
+		hasNext := offset+len(rep.Queue) < total
 		hasPrev := offset > 0
-		
+
 		fmt.Println()
 		if hasNext {
 			fmt.Println("6 - Próximos 5")
@@ -286,24 +286,28 @@ func solveProblemMenu(reader *bufio.Reader, gateways map[string]string) {
 		}
 		fmt.Println("8 - Atualizar lista")
 		fmt.Println("0 - Cancelar")
-		
+
 		fmt.Print("\nEscolha uma opção: ")
 		choice := readChoice(reader)
-		
+
 		switch choice {
 		case "0":
 			return
 		case "6":
-			if hasNext { offset += limit }
+			if hasNext {
+				offset += limit
+			}
 		case "7":
-			if hasPrev { offset -= limit }
+			if hasPrev {
+				offset -= limit
+			}
 		case "8":
 			// Apenas repete o loop sem alterar o offset
 		case "1", "2", "3", "4", "5":
 			idx, err := strconv.Atoi(choice)
 			if err == nil && idx > 0 && idx <= len(rep.Queue) {
 				selected := rep.Queue[idx-1]
-				dispatchClientMission(reader, selected, sector, gateways)
+				dispatchClientMission(reader, selected, gateways)
 				return
 			}
 		default:
@@ -312,13 +316,13 @@ func solveProblemMenu(reader *bufio.Reader, gateways map[string]string) {
 	}
 }
 
-func dispatchClientMission(reader *bufio.Reader, selected AlertRequest, targetSector string, gateways map[string]string) {
+func dispatchClientMission(reader *bufio.Reader, selected AlertRequest, gateways map[string]string) {
 	fmt.Printf("\nVocê selecionou o problema: %s\n", selected.Occurrence)
-	
+
 	companyID := defaultCompanies[rand.Intn(len(defaultCompanies))]
 	msg := Message{
 		Type:       "MISSION_SUBMIT",
-		RequestID:  selected.RequestID, 
+		RequestID:  selected.RequestID,
 		Priority:   selected.Priority,
 		Occurrence: selected.Occurrence,
 		CompanyID:  companyID,
@@ -326,7 +330,7 @@ func dispatchClientMission(reader *bufio.Reader, selected AlertRequest, targetSe
 	custo := selected.Priority * 10
 	fmt.Printf("[CLIENTE] Transmitindo solicitacao de missao a malha...\n")
 	fmt.Printf("[ECONOMIA] O navio '%s' pagará %d tokens por este despacho!\n", companyID, custo)
-	
+
 	conn, _, err := getAvailableGatewayConn(gateways)
 	if err != nil {
 		fmt.Println("Erro ao conectar à malha.")
@@ -334,11 +338,11 @@ func dispatchClientMission(reader *bufio.Reader, selected AlertRequest, targetSe
 	}
 	defer conn.Close()
 	json.NewEncoder(conn).Encode(msg)
-	
+
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var ack Message
 	json.NewDecoder(conn).Decode(&ack)
-	
+
 	if ack.Status == "OK" {
 		fmt.Printf("[CLIENTE] Missão autorizada! (ID: %s)\n", ack.MissionID)
 	} else {
@@ -347,7 +351,6 @@ func dispatchClientMission(reader *bufio.Reader, selected AlertRequest, targetSe
 	fmt.Println("\nPressione Enter para continuar...")
 	reader.ReadString('\n')
 }
-
 
 func printStatus(sectors []string, gateways map[string]string) {
 	fmt.Println("--- STATUS DO ESTREITO ---")
@@ -362,7 +365,7 @@ func printStatus(sectors []string, gateways map[string]string) {
 		go func(idx int, setor string) {
 			defer wg.Done()
 			addr := gateways[setor]
-			conn, err := dialTransport(addr, 2*time.Second)
+			conn, err := dialTransport(addr, 5*time.Second)
 			if err != nil {
 				sectorResults[idx] = fmt.Sprintf("[Setor %s] OFFLINE", setor)
 				return
@@ -375,7 +378,7 @@ func printStatus(sectors []string, gateways map[string]string) {
 			}
 
 			var reply Message
-			conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 			if err := json.NewDecoder(conn).Decode(&reply); err != nil || reply.Type != "STATUS_REP" {
 				sectorResults[idx] = fmt.Sprintf("[Setor %s] OFFLINE", setor)
 				return
@@ -520,7 +523,6 @@ func printStatus(sectors []string, gateways map[string]string) {
 	bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
-
 func viewEventLog(reader *bufio.Reader, sectors []string, gateways map[string]string) {
 	fmt.Println("--- LOG DE EVENTOS ---")
 	fmt.Print("Quantos eventos deseja ver por setor? ")
@@ -529,7 +531,7 @@ func viewEventLog(reader *bufio.Reader, sectors []string, gateways map[string]st
 
 	for _, sector := range sectors {
 		addr := gateways[sector]
-		conn, err := dialTransport(addr, 2*time.Second)
+		conn, err := dialTransport(addr, 5*time.Second)
 		if err != nil {
 			fmt.Printf("[Setor %s] OFFLINE\n", sector)
 			continue
@@ -693,46 +695,79 @@ func clearMenuLines(linhas int) {
 
 // --- QUIC TRANSPORT ABSTRACTION ---
 
-var useQUIC = os.Getenv("USE_QUIC") == "true"
+var (
+	quicConns = make(map[string]quic.Connection)
+	quicMutex sync.Mutex
+)
 
-func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
-	if !useQUIC {
-		return net.DialTimeout("tcp", addr, timeout)
+func getQuicConnection(addr string, timeout time.Duration) (quic.Connection, error) {
+	quicMutex.Lock()
+	defer quicMutex.Unlock()
+
+	if conn, ok := quicConns[addr]; ok {
+		return conn, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"hormuz-quic"},
 	}
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	quicConfig := &quic.Config{
+		KeepAlivePeriod: 10 * time.Second,
+	}
+
+	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConfig)
 	if err != nil {
 		return nil, fmt.Errorf("quic dial error: %w", err)
 	}
+
+	quicConns[addr] = conn
+	return conn, nil
+}
+
+func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
+	conn, err := getQuicConnection(addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		conn.CloseWithError(0, "failed to open stream")
-		return nil, fmt.Errorf("quic stream error: %w", err)
+		// A conexão pode ter caído. Remove do cache e tenta reconectar 1 vez.
+		quicMutex.Lock()
+		delete(quicConns, addr)
+		quicMutex.Unlock()
+
+		conn, err = getQuicConnection(addr, timeout)
+		if err != nil {
+			return nil, err
+		}
+
+		ctx2, cancel2 := context.WithTimeout(context.Background(), timeout)
+		defer cancel2()
+		stream, err = conn.OpenStreamSync(ctx2)
+		if err != nil {
+			return nil, fmt.Errorf("quic stream error após reconexão: %w", err)
+		}
 	}
+
 	return &quicConnWrapper{Stream: stream, conn: conn}, nil
 }
 
 type transportListener struct {
-	tcpListener  net.Listener
 	quicListener *quic.Listener
-	isQUIC       bool
 	acceptChan   chan net.Conn
 	errChan      chan error
 }
 
 func listenTransport(addr string) (*transportListener, error) {
-	if !useQUIC {
-		l, err := net.Listen("tcp", addr)
-		if err != nil {
-			return nil, err
-		}
-		return &transportListener{tcpListener: l, isQUIC: false}, nil
-	}
 	tlsConf := generateTLSConfig()
 	l, err := quic.ListenAddr(addr, tlsConf, nil)
 	if err != nil {
@@ -740,7 +775,6 @@ func listenTransport(addr string) (*transportListener, error) {
 	}
 	tl := &transportListener{
 		quicListener: l,
-		isQUIC:       true,
 		acceptChan:   make(chan net.Conn),
 		errChan:      make(chan error),
 	}
@@ -768,9 +802,6 @@ func (tl *transportListener) acceptLoop() {
 }
 
 func (tl *transportListener) Accept() (net.Conn, error) {
-	if !tl.isQUIC {
-		return tl.tcpListener.Accept()
-	}
 	select {
 	case conn := <-tl.acceptChan:
 		return conn, nil
@@ -780,16 +811,10 @@ func (tl *transportListener) Accept() (net.Conn, error) {
 }
 
 func (tl *transportListener) Close() error {
-	if !tl.isQUIC {
-		return tl.tcpListener.Close()
-	}
 	return tl.quicListener.Close()
 }
 
 func (tl *transportListener) Addr() net.Addr {
-	if !tl.isQUIC {
-		return tl.tcpListener.Addr()
-	}
 	return tl.quicListener.Addr()
 }
 
@@ -842,4 +867,3 @@ do código, e estou ciente que estes trechos não serão considerados para fins 
 Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-Agrawala.
 
 *******************************************************************************************/
-

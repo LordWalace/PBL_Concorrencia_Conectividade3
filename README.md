@@ -31,7 +31,7 @@ Este projeto implementa uma malha distribuida sem leader, sem ponto unico de fal
 - **Gateway** — coordena alertas, replicas de fila e dispatch de drones.
 - **Beacon** — gera alertas autonomos e faz failover para gateways ativos.
 - **Device** — registra-se, envia heartbeats e executa comandos de despacho.
-- **Client** — interface interativa para injetar alertas manuais e consultar status.
+- **Client** — interface interativa para injetar alertas manuais e consultar status dos drones e gateways.
 
 ---
 

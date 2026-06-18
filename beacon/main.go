@@ -16,6 +16,8 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -45,6 +47,14 @@ type Message struct {
 }
 
 // mustEnv valida que a variavel de ambiente exista antes da inicializacao do servico.
+func envOrDefault(key, def string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v
+}
+
 func mustEnv(key string) string {
 	value := os.Getenv(key)
 	if value == "" {
@@ -76,7 +86,7 @@ func main() {
 	rand.Seed(seed)
 	r := rand.New(rand.NewSource(seed))
 
-	localGatewayIP := mustEnv("GATEWAY_IP")
+	localGatewayIP := envOrDefault("GATEWAY_IP", mustEnv("IP_"+strings.ToUpper(mustEnv("SETOR_ID"))))
 	gatewayPort := mustEnv("GATEWAY_TCP_REG_PORT")
 
 	allGateways := []string{
@@ -192,46 +202,78 @@ Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-
 
 // --- QUIC TRANSPORT ABSTRACTION ---
 
-var useQUIC = os.Getenv("USE_QUIC") == "true"
+var (
+	quicConns = make(map[string]quic.Connection)
+	quicMutex sync.Mutex
+)
 
-func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
-	if !useQUIC {
-		return net.DialTimeout("tcp", addr, timeout)
+func getQuicConnection(addr string, timeout time.Duration) (quic.Connection, error) {
+	quicMutex.Lock()
+	defer quicMutex.Unlock()
+
+	if conn, ok := quicConns[addr]; ok {
+		return conn, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"hormuz-quic"},
 	}
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	quicConfig := &quic.Config{
+		KeepAlivePeriod: 10 * time.Second,
+	}
+
+	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConfig)
 	if err != nil {
 		return nil, fmt.Errorf("quic dial error: %w", err)
 	}
+
+	quicConns[addr] = conn
+	return conn, nil
+}
+
+func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
+	conn, err := getQuicConnection(addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		conn.CloseWithError(0, "failed to open stream")
-		return nil, fmt.Errorf("quic stream error: %w", err)
+		quicMutex.Lock()
+		delete(quicConns, addr)
+		quicMutex.Unlock()
+
+		conn, err = getQuicConnection(addr, timeout)
+		if err != nil {
+			return nil, err
+		}
+
+		ctx2, cancel2 := context.WithTimeout(context.Background(), timeout)
+		defer cancel2()
+		stream, err = conn.OpenStreamSync(ctx2)
+		if err != nil {
+			return nil, fmt.Errorf("quic stream error após reconexão: %w", err)
+		}
 	}
+
 	return &quicConnWrapper{Stream: stream, conn: conn}, nil
 }
 
 type transportListener struct {
-	tcpListener  net.Listener
 	quicListener *quic.Listener
-	isQUIC       bool
 	acceptChan   chan net.Conn
 	errChan      chan error
 }
 
 func listenTransport(addr string) (*transportListener, error) {
-	if !useQUIC {
-		l, err := net.Listen("tcp", addr)
-		if err != nil {
-			return nil, err
-		}
-		return &transportListener{tcpListener: l, isQUIC: false}, nil
-	}
 	tlsConf := generateTLSConfig()
 	l, err := quic.ListenAddr(addr, tlsConf, nil)
 	if err != nil {
@@ -239,7 +281,6 @@ func listenTransport(addr string) (*transportListener, error) {
 	}
 	tl := &transportListener{
 		quicListener: l,
-		isQUIC:       true,
 		acceptChan:   make(chan net.Conn),
 		errChan:      make(chan error),
 	}
@@ -267,9 +308,6 @@ func (tl *transportListener) acceptLoop() {
 }
 
 func (tl *transportListener) Accept() (net.Conn, error) {
-	if !tl.isQUIC {
-		return tl.tcpListener.Accept()
-	}
 	select {
 	case conn := <-tl.acceptChan:
 		return conn, nil
@@ -279,16 +317,10 @@ func (tl *transportListener) Accept() (net.Conn, error) {
 }
 
 func (tl *transportListener) Close() error {
-	if !tl.isQUIC {
-		return tl.tcpListener.Close()
-	}
 	return tl.quicListener.Close()
 }
 
 func (tl *transportListener) Addr() net.Addr {
-	if !tl.isQUIC {
-		return tl.tcpListener.Addr()
-	}
 	return tl.quicListener.Addr()
 }
 

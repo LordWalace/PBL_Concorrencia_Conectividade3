@@ -55,6 +55,14 @@ var (
 	currentCompanyID   string
 )
 
+func envOrDefault(key, def string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v
+}
+
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -77,10 +85,10 @@ func mustDurationEnv(key string) time.Duration {
 
 func main() {
 	// Correção: seed removido (obsoleto e automático em Go recentes)
-	droneID = mustEnv("DEVICE_ID")
-	deviceIP = mustEnv("DEVICE_IP")
-	deviceHost = mustEnv("DEVICE_HOST")
-	deviceControlPort = mustEnv("DEVICE_CONTROL_PORT")
+	droneID = envOrDefault("DEVICE_ID", "Drone")
+	deviceIP = envOrDefault("DEVICE_IP", "")
+	deviceHost = envOrDefault("DEVICE_HOST", "0.0.0.0")
+	deviceControlPort = envOrDefault("DEVICE_CONTROL_PORT", "8083")
 	setorID = mustEnv("SETOR_ID")
 
 	gatewayNames = []string{"Norte", "Sul", "Leste", "Oeste"}
@@ -515,12 +523,7 @@ func currentMissionInfo() string {
 
 // --- QUIC TRANSPORT ABSTRACTION ---
 
-var useQUIC = os.Getenv("USE_QUIC") == "true"
-
 func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
-	if !useQUIC {
-		return net.DialTimeout("tcp", addr, timeout)
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	tlsConf := &tls.Config{
@@ -540,21 +543,12 @@ func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
 }
 
 type transportListener struct {
-	tcpListener  net.Listener
 	quicListener *quic.Listener
-	isQUIC       bool
 	acceptChan   chan net.Conn
 	errChan      chan error
 }
 
 func listenTransport(addr string) (*transportListener, error) {
-	if !useQUIC {
-		l, err := net.Listen("tcp", addr)
-		if err != nil {
-			return nil, err
-		}
-		return &transportListener{tcpListener: l, isQUIC: false}, nil
-	}
 	tlsConf := generateTLSConfig()
 	l, err := quic.ListenAddr(addr, tlsConf, nil)
 	if err != nil {
@@ -562,7 +556,6 @@ func listenTransport(addr string) (*transportListener, error) {
 	}
 	tl := &transportListener{
 		quicListener: l,
-		isQUIC:       true,
 		acceptChan:   make(chan net.Conn),
 		errChan:      make(chan error),
 	}
@@ -590,9 +583,6 @@ func (tl *transportListener) acceptLoop() {
 }
 
 func (tl *transportListener) Accept() (net.Conn, error) {
-	if !tl.isQUIC {
-		return tl.tcpListener.Accept()
-	}
 	select {
 	case conn := <-tl.acceptChan:
 		return conn, nil
@@ -602,16 +592,10 @@ func (tl *transportListener) Accept() (net.Conn, error) {
 }
 
 func (tl *transportListener) Close() error {
-	if !tl.isQUIC {
-		return tl.tcpListener.Close()
-	}
 	return tl.quicListener.Close()
 }
 
 func (tl *transportListener) Addr() net.Addr {
-	if !tl.isQUIC {
-		return tl.tcpListener.Addr()
-	}
 	return tl.quicListener.Addr()
 }
 

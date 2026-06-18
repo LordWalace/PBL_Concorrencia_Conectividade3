@@ -171,7 +171,8 @@ services:
     tty: true
     networks:
       hormuz_net:
-        ipv4_address: 172.16.103.100
+        ipv4_address: 172.16.103.101
+
   admin:
     build: ./admin
     container_name: admin
@@ -180,12 +181,12 @@ services:
     tty: true
     networks:
       hormuz_net:
-        ipv4_address: 172.16.103.101
+        ipv4_address: 172.16.103.100
 
 networks:
-    hormuz_net:
-      driver: bridge
-      ipam:
-        driver: default
-        config:
-          - subnet: 172.16.103.0/24
+  hormuz_net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.16.103.0/24
