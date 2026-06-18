@@ -154,7 +154,7 @@ func main() {
 
 		case "2":
 			clearScreen()
-			sendManualAlert(reader, sectors, gateways, false)
+			solveProblemMenu(reader, gateways)
 			skipNextClear = true
 
 		case "3":
@@ -212,30 +212,140 @@ func sendManualAlert(reader *bufio.Reader, sectors []string, gateways map[string
 	requestID := fmt.Sprintf("client:%s:%d", setorEscolhido, time.Now().UnixNano())
 
 	var msg Message
-	if isEnvironmental {
-		msg = Message{
-			Type:       "ALERT",
-			RequestID:  requestID,
-			Priority:   option.Priority,
-			Occurrence: option.Description,
-			CompanyID:  "", // Vazio = Evento Ambiental
-		}
-		fmt.Printf("\n[BEACON MOCK] Injetando evento no setor %s...\n", setorEscolhido)
-	} else {
-		companyID := defaultCompanies[rand.Intn(len(defaultCompanies))]
-		msg = Message{
-			Type:       "MISSION_SUBMIT",
-			RequestID:  requestID,
-			Priority:   option.Priority,
-			Occurrence: option.Description,
-			CompanyID:  companyID,
-		}
-		custo := option.Priority * 10
-		fmt.Printf("\n[CLIENTE] Transmitindo alerta para o setor %s...\n", setorEscolhido)
-		fmt.Printf("[ECONOMIA] O navio '%s' pagará %d tokens por este despacho!\n", companyID, custo)
+	msg = Message{
+		Type:       "ALERT",
+		RequestID:  requestID,
+		Priority:   option.Priority,
+		Occurrence: option.Description,
+		CompanyID:  "", // Vazio = Evento Ambiental
 	}
-
+	fmt.Printf("\n[BEACON MOCK] Injetando evento no setor %s...\n", setorEscolhido)
 	sendWithFallback(msg, setorEscolhido, sectors, gateways)
+}
+
+func solveProblemMenu(reader *bufio.Reader, gateways map[string]string) {
+	offset := 0
+	limit := 5
+
+	for {
+		clearScreen()
+		fmt.Println("--- RESOLVER PROBLEMA EXISTENTE ---")
+		
+		conn, sector, err := getAvailableGatewayConn(gateways)
+		if err != nil {
+			fmt.Println("Nenhum gateway disponível para consultar problemas.")
+			fmt.Println("\nPressione Enter para voltar...")
+			reader.ReadString('\n')
+			return
+		}
+		
+		req := Message{
+			Type: "PROBLEMS_REQ",
+			Payload: map[string]string{
+				"offset": strconv.Itoa(offset),
+				"limit": strconv.Itoa(limit),
+			},
+		}
+		json.NewEncoder(conn).Encode(req)
+		
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		var rep Message
+		err = json.NewDecoder(conn).Decode(&rep)
+		conn.Close()
+		
+		if err != nil || rep.Type != "PROBLEMS_REP" {
+			fmt.Println("Erro ao buscar problemas no gateway.")
+			fmt.Println("\nPressione Enter para voltar...")
+			reader.ReadString('\n')
+			return
+		}
+		
+		total, _ := strconv.Atoi(rep.Payload["total"])
+		
+		if total == 0 {
+			fmt.Println("Nenhum problema pendente no Estreito.")
+			fmt.Println("\nPressione Enter para voltar...")
+			reader.ReadString('\n')
+			return
+		}
+		
+		fmt.Printf("Problemas pendentes (%d encontrados, exibindo paginacao):\n\n", total)
+		for i, p := range rep.Queue {
+			fmt.Printf("%d - %s (Prioridade: %d, Origem: %s)\n", i+1, p.Occurrence, p.Priority, p.GatewayID)
+		}
+		
+		hasNext := offset + len(rep.Queue) < total
+		hasPrev := offset > 0
+		
+		fmt.Println()
+		if hasNext {
+			fmt.Println("6 - Próximos 5")
+		}
+		if hasPrev {
+			fmt.Println("7 - Anteriores 5")
+		}
+		fmt.Println("8 - Atualizar lista")
+		fmt.Println("0 - Cancelar")
+		
+		fmt.Print("\nEscolha uma opção: ")
+		choice := readChoice(reader)
+		
+		switch choice {
+		case "0":
+			return
+		case "6":
+			if hasNext { offset += limit }
+		case "7":
+			if hasPrev { offset -= limit }
+		case "8":
+			// Apenas repete o loop sem alterar o offset
+		case "1", "2", "3", "4", "5":
+			idx, err := strconv.Atoi(choice)
+			if err == nil && idx > 0 && idx <= len(rep.Queue) {
+				selected := rep.Queue[idx-1]
+				dispatchClientMission(reader, selected, sector, gateways)
+				return
+			}
+		default:
+			continue
+		}
+	}
+}
+
+func dispatchClientMission(reader *bufio.Reader, selected AlertRequest, targetSector string, gateways map[string]string) {
+	fmt.Printf("\nVocê selecionou o problema: %s\n", selected.Occurrence)
+	
+	companyID := defaultCompanies[rand.Intn(len(defaultCompanies))]
+	msg := Message{
+		Type:       "MISSION_SUBMIT",
+		RequestID:  selected.RequestID, 
+		Priority:   selected.Priority,
+		Occurrence: selected.Occurrence,
+		CompanyID:  companyID,
+	}
+	custo := selected.Priority * 10
+	fmt.Printf("[CLIENTE] Transmitindo solicitacao de missao a malha...\n")
+	fmt.Printf("[ECONOMIA] O navio '%s' pagará %d tokens por este despacho!\n", companyID, custo)
+	
+	conn, _, err := getAvailableGatewayConn(gateways)
+	if err != nil {
+		fmt.Println("Erro ao conectar à malha.")
+		return
+	}
+	defer conn.Close()
+	json.NewEncoder(conn).Encode(msg)
+	
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var ack Message
+	json.NewDecoder(conn).Decode(&ack)
+	
+	if ack.Status == "OK" {
+		fmt.Printf("[CLIENTE] Missão autorizada! (ID: %s)\n", ack.MissionID)
+	} else {
+		fmt.Printf("[CLIENTE] Fatura retida. Motivo: %s\n", ack.Content)
+	}
+	fmt.Println("\nPressione Enter para continuar...")
+	reader.ReadString('\n')
 }
 
 

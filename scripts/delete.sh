@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PROJECT_NAME="pbl_concorrencia_conectividade2"
+PROJECT_NAME="pbl_redes-sensores3"
 
 echo "Stopping and removing compose services (project=${PROJECT_NAME})..."
 docker compose down --rmi all --volumes --remove-orphans || true
