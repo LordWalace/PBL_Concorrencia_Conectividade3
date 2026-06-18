@@ -367,7 +367,7 @@ func printStatus(sectors []string, gateways map[string]string) {
 			addr := gateways[setor]
 			conn, err := dialTransport(addr, 5*time.Second)
 			if err != nil {
-				sectorResults[idx] = fmt.Sprintf("[Setor %s] OFFLINE", setor)
+				sectorResults[idx] = fmt.Sprintf("[Setor %s] OFFLINE (dial err: %v)", setor, err)
 				return
 			}
 			defer conn.Close()
@@ -379,8 +379,12 @@ func printStatus(sectors []string, gateways map[string]string) {
 
 			var reply Message
 			conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-			if err := json.NewDecoder(conn).Decode(&reply); err != nil || reply.Type != "STATUS_REP" {
-				sectorResults[idx] = fmt.Sprintf("[Setor %s] OFFLINE", setor)
+			if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+				sectorResults[idx] = fmt.Sprintf("[Setor %s] OFFLINE (decode err: %v)", setor, err)
+				return
+			}
+			if reply.Type != "STATUS_REP" {
+				sectorResults[idx] = fmt.Sprintf("[Setor %s] OFFLINE (bad type: %s)", setor, reply.Type)
 				return
 			}
 			queueSize := reply.Payload["queue_size"]
@@ -702,11 +706,11 @@ var (
 
 func getQuicConnection(addr string, timeout time.Duration) (quic.Connection, error) {
 	quicMutex.Lock()
-	defer quicMutex.Unlock()
-
 	if conn, ok := quicConns[addr]; ok {
+		quicMutex.Unlock()
 		return conn, nil
 	}
+	quicMutex.Unlock()
 
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
@@ -725,7 +729,15 @@ func getQuicConnection(addr string, timeout time.Duration) (quic.Connection, err
 		return nil, fmt.Errorf("quic dial error: %w", err)
 	}
 
+	quicMutex.Lock()
+	if existing, ok := quicConns[addr]; ok {
+		quicMutex.Unlock()
+		conn.CloseWithError(0, "")
+		return existing, nil
+	}
 	quicConns[addr] = conn
+	quicMutex.Unlock()
+
 	return conn, nil
 }
 

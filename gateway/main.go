@@ -2671,11 +2671,11 @@ var (
 
 func getQuicConnection(addr string, timeout time.Duration) (quic.Connection, error) {
 	quicMutex.Lock()
-	defer quicMutex.Unlock()
-
 	if conn, ok := quicConns[addr]; ok {
+		quicMutex.Unlock()
 		return conn, nil
 	}
+	quicMutex.Unlock()
 
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
@@ -2694,7 +2694,15 @@ func getQuicConnection(addr string, timeout time.Duration) (quic.Connection, err
 		return nil, fmt.Errorf("quic dial error: %w", err)
 	}
 
+	quicMutex.Lock()
+	if existing, ok := quicConns[addr]; ok {
+		quicMutex.Unlock()
+		conn.CloseWithError(0, "")
+		return existing, nil
+	}
 	quicConns[addr] = conn
+	quicMutex.Unlock()
+
 	return conn, nil
 }
 
