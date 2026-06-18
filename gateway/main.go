@@ -2802,7 +2802,10 @@ type quicConnWrapper struct {
 
 func (w *quicConnWrapper) LocalAddr() net.Addr  { return w.conn.LocalAddr() }
 func (w *quicConnWrapper) RemoteAddr() net.Addr { return w.conn.RemoteAddr() }
-func (w *quicConnWrapper) Close() error         { return w.Stream.Close() }
+func (w *quicConnWrapper) Close() error {
+	w.Stream.CancelRead(0)
+	return w.Stream.Close()
+}
 
 func generateTLSConfig() *tls.Config {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
