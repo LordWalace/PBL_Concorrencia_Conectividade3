@@ -2,39 +2,29 @@ package main
 
 import (
 	"bufio"
-	"context"
-	crand "crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"log"
-	"math/big"
 	"math/rand"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
 type Message struct {
-	Type        string            `json:"type"`
-	DroneID     string            `json:"drone_id,omitempty"`
-	GatewayID   string            `json:"gateway_id,omitempty"`
-	RequestID   string            `json:"request_id,omitempty"`
-	Priority    int               `json:"priority,omitempty"`
-	Lamport     int               `json:"lamport,omitempty"`
-	Timestamp   int64             `json:"timestamp,omitempty"`
-	Payload     map[string]string `json:"payload,omitempty"`
-	Content     string            `json:"content,omitempty"`
-	Status      string            `json:"status,omitempty"`
-	CompanyID   string            `json:"company_id,omitempty"`
+	Type      string            `json:"type"`
+	DroneID   string            `json:"drone_id,omitempty"`
+	GatewayID string            `json:"gateway_id,omitempty"`
+	RequestID string            `json:"request_id,omitempty"`
+	Priority  int               `json:"priority,omitempty"`
+	Lamport   int               `json:"lamport,omitempty"`
+	Timestamp int64             `json:"timestamp,omitempty"`
+	Payload   map[string]string `json:"payload,omitempty"`
+	Content   string            `json:"content,omitempty"`
+	Status    string            `json:"status,omitempty"`
+	CompanyID string            `json:"company_id,omitempty"`
 }
 
 func mustEnv(key string) string {
@@ -61,11 +51,11 @@ func getCompanyList(gateways map[string]string) ([]string, error) {
 		return nil, err
 	}
 	defer conn.Close()
-	
+
 	msg := Message{Type: "COMPANY_LIST_REQ"}
 	json.NewEncoder(conn).Encode(msg)
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	
+
 	var reply Message
 	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
 		return nil, err
@@ -73,7 +63,7 @@ func getCompanyList(gateways map[string]string) ([]string, error) {
 	if reply.Type != "COMPANY_LIST_REP" {
 		return nil, fmt.Errorf("invalid reply")
 	}
-	
+
 	var list []string
 	json.Unmarshal([]byte(reply.Content), &list)
 	return list, nil
@@ -92,7 +82,7 @@ func selectCompany(reader *bufio.Reader, gateways map[string]string) string {
 	}
 	fmt.Println("0 - Voltar")
 	fmt.Print("\nEscolha: ")
-	
+
 	for {
 		line, _ := reader.ReadString('\n')
 		idx, err := strconv.Atoi(strings.TrimSpace(line))
@@ -215,13 +205,13 @@ func adminRegisterCompany(reader *bufio.Reader, gateways map[string]string) {
 }
 
 func adminCredit(reader *bufio.Reader, gateways map[string]string) {
-	fmt.Println("--- ADICIONAR CRÉDITOS MANUALMENTE ---")
+	fmt.Println("--- ADICIONAR TOKENS MANUALMENTE ---")
 	companyID := selectCompany(reader, gateways)
 	if companyID == "" {
 		return
 	}
 
-	fmt.Printf("\nQuantos créditos deseja adicionar à empresa '%s'? ", companyID)
+	fmt.Printf("\nQuantos tokens deseja adicionar à empresa '%s'? (1 token = 10 créditos): ", companyID)
 	amountStr := readChoice(reader)
 	amount, err := strconv.Atoi(amountStr)
 	if err != nil || amount <= 0 {
@@ -240,8 +230,8 @@ func adminCredit(reader *bufio.Reader, gateways map[string]string) {
 
 	msg := Message{Type: "ADMIN_CREDIT", CompanyID: companyID, Payload: map[string]string{"amount": amountStr}}
 	json.NewEncoder(conn).Encode(msg)
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+
 	var reply Message
 	if err := json.NewDecoder(conn).Decode(&reply); err == nil && reply.Type == "ADMIN_CREDIT_ACK" {
 		if reply.Status == "OK" {
@@ -273,10 +263,10 @@ func adminBalance(reader *bufio.Reader, gateways map[string]string) {
 
 	msg := Message{Type: "BALANCE_REQ", CompanyID: companyID}
 	json.NewEncoder(conn).Encode(msg)
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var reply Message
 	if err := json.NewDecoder(conn).Decode(&reply); err == nil && reply.Type == "BALANCE_REP" {
-		fmt.Printf("\n[Gateway %s] Saldo da empresa %s: %s créditos\n", gwName, companyID, reply.Content)
+		fmt.Printf("\n[Gateway %s] Saldo da empresa %s: %s tokens (%s créditos)\n", gwName, companyID, reply.Payload["active_tokens"], reply.Payload["active_credits"])
 	} else {
 		fmt.Println("\n[ERRO] Falha ao consultar saldo.")
 	}
@@ -324,7 +314,7 @@ func adminAudit(reader *bufio.Reader, gateways map[string]string) {
 		fmt.Println("3 - Ver Tokens Gastos por Empresa")
 		fmt.Println("0 - Voltar")
 		fmt.Print("Escolha: ")
-		
+
 		choice := readChoice(reader)
 		switch choice {
 		case "1":
@@ -352,14 +342,14 @@ func adminLedgerGlobal(reader *bufio.Reader, gateways map[string]string) {
 	msg := Message{Type: "LEDGER_GLOBAL_REQ"}
 	json.NewEncoder(conn).Encode(msg)
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	
+
 	var reply Message
 	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
 		fmt.Println("\n[ERRO] Falha ao ler resposta.")
 		reader.ReadString('\n')
 		return
 	}
-	
+
 	var recs []map[string]interface{}
 	json.Unmarshal([]byte(reply.Content), &recs)
 
@@ -369,13 +359,19 @@ func adminLedgerGlobal(reader *bufio.Reader, gateways map[string]string) {
 	} else {
 		for i, r := range recs {
 			t := ""
-			if typeVal, ok := r["type"].(string); ok { t = typeVal }
+			if typeVal, ok := r["type"].(string); ok {
+				t = typeVal
+			}
 			tsVal, _ := r["timestamp"].(float64)
 			date := time.Unix(int64(tsVal), 0).Format("15:04:05")
 			compId := ""
-			if c, ok := r["company_id"].(string); ok { compId = c }
+			if c, ok := r["company_id"].(string); ok {
+				compId = c
+			}
 			detail := ""
-			if d, ok := r["detail"].(string); ok { detail = d }
+			if d, ok := r["detail"].(string); ok {
+				detail = d
+			}
 			fmt.Printf("%d. [%s] %s | Cia: %s | Detalhe: %s\n", i+1, date, t, compId, detail)
 		}
 	}
@@ -400,7 +396,7 @@ func adminLedgerCompany(reader *bufio.Reader, gateways map[string]string) {
 	msg := Message{Type: "LEDGER_REQ", CompanyID: companyID, Payload: map[string]string{"limit": "50"}}
 	json.NewEncoder(conn).Encode(msg)
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	
+
 	var reply Message
 	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
 		fmt.Println("\n[ERRO] Falha ao ler resposta.")
@@ -416,11 +412,15 @@ func adminLedgerCompany(reader *bufio.Reader, gateways map[string]string) {
 	} else {
 		for i, r := range recs {
 			t := ""
-			if typeVal, ok := r["type"].(string); ok { t = typeVal }
+			if typeVal, ok := r["type"].(string); ok {
+				t = typeVal
+			}
 			tsVal, _ := r["timestamp"].(float64)
 			date := time.Unix(int64(tsVal), 0).Format("15:04:05")
 			detail := ""
-			if d, ok := r["detail"].(string); ok { detail = d }
+			if d, ok := r["detail"].(string); ok {
+				detail = d
+			}
 			fmt.Printf("%d. [%s] %s | Detalhe: %s\n", i+1, date, t, detail)
 		}
 	}
@@ -477,59 +477,12 @@ func clearMenuLines(linhas int) {
 	fmt.Printf("\033[%dA\033[J", linhas)
 }
 
-// --- QUIC TRANSPORT ABSTRACTION ---
+// --- TCP TRANSPORT ABSTRACTION ---
 
 func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"hormuz-quic"},
-	}
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, nil)
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return nil, fmt.Errorf("quic dial error: %w", err)
+		return nil, fmt.Errorf("tcp dial error: %w", err)
 	}
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		conn.CloseWithError(0, "failed to open stream")
-		return nil, fmt.Errorf("quic stream error: %w", err)
-	}
-	return &quicConnWrapper{Stream: stream, conn: conn}, nil
-}
-
-type quicConnWrapper struct {
-	quic.Stream
-	conn quic.Connection
-}
-
-func (w *quicConnWrapper) LocalAddr() net.Addr  { return w.conn.LocalAddr() }
-func (w *quicConnWrapper) RemoteAddr() net.Addr { return w.conn.RemoteAddr() }
-func (w *quicConnWrapper) Close() error         { return w.Stream.Close() }
-
-func generateTLSConfig() *tls.Config {
-	key, err := rsa.GenerateKey(crand.Reader, 2048)
-	if err != nil {
-		panic(err)
-	}
-	template := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{Organization: []string{"Hormuz"}},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	certDER, err := x509.CreateCertificate(crand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		panic(err)
-	}
-	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"hormuz-quic"}}
+	return conn, nil
 }

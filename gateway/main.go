@@ -2,19 +2,11 @@ package main
 
 import (
 	"container/heap"
-	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"log"
-	"math/big"
 	"net"
 	"os"
 	"sort"
@@ -22,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -463,7 +453,7 @@ func startServer(host, port string, handler func(net.Conn)) {
 	if err != nil {
 		log.Fatalf("[GATEWAY/%s] Falha ao escutar em %s: %v", gatewayID, addr, err)
 	}
-	log.Printf("[GATEWAY/%s] Servidor QUIC ativo em %s", gatewayID, addr)
+	log.Printf("[GATEWAY/%s] Servidor TCP ativo em %s", gatewayID, addr)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -478,6 +468,7 @@ func handlePeerConnection(conn net.Conn) {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var msg Message
 	if err := json.NewDecoder(conn).Decode(&msg); err != nil {
+		log.Printf("[GATEWAY/%s] Erro ao decodificar (reg): %v", gatewayID, err)
 		return
 	}
 	updateLamport(msg.Lamport)
@@ -533,6 +524,7 @@ func handleRegConnection(conn net.Conn) {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var msg Message
 	if err := json.NewDecoder(conn).Decode(&msg); err != nil {
+		log.Printf("[GATEWAY/%s] Erro ao decodificar (client): %v", gatewayID, err)
 		return
 	}
 	updateLamport(msg.Lamport)
@@ -559,6 +551,7 @@ func handleRegConnection(conn net.Conn) {
 	case MsgMissionReport:
 		recordMissionReport(msg)
 	case MsgStatusReq:
+		log.Printf("[GATEWAY/%s] Recebido MsgStatusReq na porta CLIENT", gatewayID)
 		sendStatusRep(conn)
 	case MsgEventsReq:
 		sendEventsRep(conn, msg)
@@ -570,6 +563,7 @@ func handleClientConnection(conn net.Conn) {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var msg Message
 	if err := json.NewDecoder(conn).Decode(&msg); err != nil {
+		log.Printf("[GATEWAY/%s] Erro ao decodificar (peer): %v", gatewayID, err)
 		return
 	}
 	switch msg.Type {
@@ -620,6 +614,7 @@ func handleClientConnection(conn net.Conn) {
 		sendLedgerRep(conn, companyID, limit)
 
 	case MsgStatusReq:
+		log.Printf("[GATEWAY/%s] Recebido MsgStatusReq na porta PEER", gatewayID)
 		sendStatusRep(conn)
 	case MsgEventsReq:
 		sendEventsRep(conn, msg)
@@ -1015,9 +1010,9 @@ func processQueueLoop() {
 			repliesCount[targetDrone] = 0
 			currentReqRetries[targetDrone] = req.RetryCount
 			myCurrentReq[targetDrone] = Message{Type: MsgRequest, DroneID: targetDrone, GatewayID: gatewayID, Priority: req.Priority, Lamport: req.Lamport, Occurrence: req.Occurrence, RequestID: req.RequestID, CompanyID: req.CompanyID, MissionID: req.MissionID}
+			msg := myCurrentReq[targetDrone]
 			stateMutex.Unlock()
 
-			msg := myCurrentReq[targetDrone]
 			msg.Lamport = tickLamport(0)
 			go waitForReplies(targetDrone, msg)
 			continue
@@ -2446,8 +2441,8 @@ func enqueueCreditWait(req *AlertRequest) {
 
 func enqueueAlertPaid(req *AlertRequest) {
 	stateMutex.Lock()
-	defer stateMutex.Unlock()
 	if isRequestClaimed(req.RequestID) {
+		stateMutex.Unlock()
 		return
 	}
 	seenAlerts[req.RequestID] = true
@@ -2456,10 +2451,13 @@ func enqueueAlertPaid(req *AlertRequest) {
 			reqQueue[i] = req
 			heap.Fix(&reqQueue, i)
 			notifyQueueProcessor()
+			stateMutex.Unlock()
 			return
 		}
 	}
 	heap.Push(&reqQueue, req)
+	stateMutex.Unlock()
+
 	notifyQueueProcessor()
 	logEvent(fmt.Sprintf("[ECONOMY] Missão %s paga e enfileirada: %s", req.MissionID, req.Occurrence))
 	log.Printf("[GATEWAY/%s] [ECONOMY] Missão %s enfileirada após pagamento", gatewayID, req.MissionID)
@@ -2662,176 +2660,23 @@ Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-
 
 *******************************************************************************************/
 
-// --- QUIC TRANSPORT ABSTRACTION ---
+// --- TCP TRANSPORT ABSTRACTION ---
 
-var (
-	quicConns = make(map[string]quic.Connection)
-	quicMutex sync.Mutex
-)
-
-func getQuicConnection(addr string, timeout time.Duration) (quic.Connection, error) {
-	quicMutex.Lock()
-	if conn, ok := quicConns[addr]; ok {
-		quicMutex.Unlock()
-		return conn, nil
-	}
-	quicMutex.Unlock()
-
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"hormuz-quic"},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	quicConfig := &quic.Config{
-		KeepAlivePeriod: 10 * time.Second,
-	}
-
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConfig)
+func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return nil, fmt.Errorf("quic dial error: %w", err)
+		return nil, fmt.Errorf("tcp dial error: %w", err)
 	}
-
-	quicMutex.Lock()
-	if existing, ok := quicConns[addr]; ok {
-		quicMutex.Unlock()
-		conn.CloseWithError(0, "")
-		return existing, nil
-	}
-	quicConns[addr] = conn
-	quicMutex.Unlock()
-
 	return conn, nil
 }
 
-func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
-	conn, err := getQuicConnection(addr, timeout)
+func listenTransport(addr string) (net.Listener, error) {
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		quicMutex.Lock()
-		delete(quicConns, addr)
-		quicMutex.Unlock()
-
-		conn, err = getQuicConnection(addr, timeout)
-		if err != nil {
-			return nil, err
-		}
-
-		ctx2, cancel2 := context.WithTimeout(context.Background(), timeout)
-		defer cancel2()
-		stream, err = conn.OpenStreamSync(ctx2)
-		if err != nil {
-			return nil, fmt.Errorf("quic stream error após reconexão: %w", err)
-		}
-	}
-
-	return &quicConnWrapper{Stream: stream, conn: conn}, nil
-}
-
-type transportListener struct {
-	quicListener *quic.Listener
-	acceptChan   chan net.Conn
-	errChan      chan error
-}
-
-func listenTransport(addr string) (*transportListener, error) {
-	tlsConf := generateTLSConfig()
-	l, err := quic.ListenAddr(addr, tlsConf, nil)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[QUIC] Listener aberto com sucesso na porta: %s", addr)
-	tl := &transportListener{
-		quicListener: l,
-		acceptChan:   make(chan net.Conn),
-		errChan:      make(chan error),
-	}
-	go tl.acceptLoop()
-	return tl, nil
-}
-
-func (tl *transportListener) acceptLoop() {
-	for {
-		conn, err := tl.quicListener.Accept(context.Background())
-		if err != nil {
-			tl.errChan <- err
-			return
-		}
-		go func(c quic.Connection) {
-			for {
-				stream, err := c.AcceptStream(context.Background())
-				if err != nil {
-					return
-				}
-				tl.acceptChan <- &quicConnWrapper{Stream: stream, conn: c}
-			}
-		}(conn)
-	}
-}
-
-func (tl *transportListener) Accept() (net.Conn, error) {
-	select {
-	case conn := <-tl.acceptChan:
-		return conn, nil
-	case err := <-tl.errChan:
-		return nil, err
-	}
-}
-
-func (tl *transportListener) Close() error {
-	return tl.quicListener.Close()
-}
-
-func (tl *transportListener) Addr() net.Addr {
-	return tl.quicListener.Addr()
-}
-
-type quicConnWrapper struct {
-	quic.Stream
-	conn quic.Connection
-}
-
-func (w *quicConnWrapper) LocalAddr() net.Addr  { return w.conn.LocalAddr() }
-func (w *quicConnWrapper) RemoteAddr() net.Addr { return w.conn.RemoteAddr() }
-func (w *quicConnWrapper) Close() error {
-	w.Stream.CancelRead(0)
-	return w.Stream.Close()
-}
-
-func generateTLSConfig() *tls.Config {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		panic(err)
-	}
-	template := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{Organization: []string{"Hormuz"}},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		panic(err)
-	}
-	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"hormuz-quic"}}
+	log.Printf("[TCP] Listener aberto com sucesso na porta: %s", addr)
+	return l, nil
 }
 
 func handleCompanyListReq(msg Message, conn net.Conn) {
@@ -2869,7 +2714,7 @@ func handleAdminCredit(msg Message, conn net.Conn) {
 		return
 	}
 
-	tokensToMint := amount / TokenCreditAmount
+	tokensToMint := amount
 	if tokensToMint == 0 {
 		tokensToMint = 1
 	}
@@ -2878,11 +2723,11 @@ func handleAdminCredit(msg Message, conn net.Conn) {
 		created, rec := mintTokens(companyID, tokensToMint, LedgerTokenMintAdmin, "", fmt.Sprintf("Credito manual admin: %d creditos", tokensToMint*TokenCreditAmount))
 		full := appendLedgerRecord(rec)
 		replicateLedgerRecord(full)
-		log.Printf("[GATEWAY/%s] [ADMIN] Credito manual: %s recebeu %d creditos", gatewayID, companyID, tokensToMint*TokenCreditAmount)
+		log.Printf("[GATEWAY/%s] [ADMIN] Credito manual: %s recebeu %d tokens (%d creditos)", gatewayID, companyID, tokensToMint, tokensToMint*TokenCreditAmount)
 		json.NewEncoder(conn).Encode(Message{
 			Type:    MsgAdminCreditAck,
 			Status:  "OK",
-			Content: fmt.Sprintf("Emitidos %d creditos para %s", len(created)*TokenCreditAmount, companyID),
+			Content: fmt.Sprintf("Emitidos %d tokens (%d créditos) para %s", len(created), len(created)*TokenCreditAmount, companyID),
 		})
 	})
 }

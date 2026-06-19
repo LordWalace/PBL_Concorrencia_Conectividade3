@@ -22,35 +22,37 @@ Este projeto implementa uma malha distribuida sem leader, sem ponto unico de fal
 
 - Exclusao mutua distribuida via algoritmo de Ricart-Agrawala
 - Ordenacao com relogios logicos de Lamport
-- Fila de alertas priorizada com persistencia local
+- Fila de alertas priorizada sem persistencia local
+- Ledger Distribuido para controle de economia de tokens e prestacao de servicos
 - Heartbeats e retries para deteccao de peers offline
 - Fallback de beacons e migracao de devices quando gateways falham
 
 ### Componentes
 
-- **Gateway** — coordena alertas, replicas de fila e dispatch de drones.
+- **Gateway** — coordena alertas, replicas de fila, dispatch de drones e mantem o ledger distribuido local.
 - **Beacon** — gera alertas autonomos e faz failover para gateways ativos.
 - **Device** — registra-se, envia heartbeats e executa comandos de despacho.
-- **Client** — interface interativa para injetar alertas manuais e consultar status dos drones e gateways.
+- **Client** — interface interativa para injetar alertas, contratar serviços e consultar status/saldo.
+- **Admin** — painel de administracao do consorcio, emissao de tokens e auditoria global do ledger.
 
 ---
 
 ## Arquitetura
 
-```
+```text
 ┌───────────────────────────────────────────────────────────────────────┐
 │                            GATEWAY                                    │
 │  TCP: GATEWAY_TCP_REG_PORT   (registro, heartbeat, RA, alertas)       │
-│  TCP: GATEWAY_TCP_CLIENT_PORT (cliente -> alertas/status/eventos)     │
-│  TCP: GATEWAY_TCP_PEER_PORT   (P2P entre gateways, healthcheck)       │
+│  TCP: GATEWAY_TCP_CLIENT_PORT (cliente/admin -> alertas, saldo, etc)  │
+│  TCP: GATEWAY_TCP_PEER_PORT   (P2P entre gateways, sincronia ledger)  │
 └───────────────────────────────────────────────────────────────────────┘
-           ▲                          ▲                    ▲
-           │                          │                    │
-┌──────────┴─────────┐       ┌────────┴───────┐       ┌────┴─────┐
-│      BEACON        │       │      CLIENT    │       │  DEVICE  │
-│  entrega alertas   │       │ injeta alertas │       │  recebe  │
-│  com failover TCP  │       │   e consulta   │       │ dispatch │
-└────────────────────┘       └────────────────┘       └──────────┘
+           ▲                 ▲                 ▲                 ▲
+           │                 │                 │                 │
+┌──────────┴─────────┐ ┌─────┴──────┐ ┌────────┴────────┐ ┌──────┴─────┐
+│      BEACON        │ │   CLIENT   │ │      ADMIN      │ │   DEVICE   │
+│  entrega alertas   │ │ injeta req │ │ emite tokens e  │ │   recebe   │
+│  com failover TCP  │ │  e saldo   │ │  audita ledger  │ │  dispatch  │
+└────────────────────┘ └────────────┘ └─────────────────┘ └────────────┘
 ```
 
 ### Protocolo e Portas
@@ -81,7 +83,7 @@ Este projeto implementa uma malha distribuida sem leader, sem ponto unico de fal
 Antes de iniciar qualquer serviço, crie o arquivo `.env` local a partir do modelo `.env.example`.
 O arquivo `.env` deve ser gerado apenas uma vez pelo seu ambiente local, usando as informacoes comentadas em `.env.example`.
 
-> Importante: `.env.example` contem blocos de exemplo para todos os setores e para o cliente.
+> Importante: `.env.example` contem blocos de exemplo para todos os setores, clientes e administrador.
 > Em um ambiente distribuido, copie apenas o bloco relevante para o seu host e nao todo o arquivo.
 
 Se voce estiver testando tudo em um unico PC com o compose raiz, é possivel começar com:
@@ -194,7 +196,11 @@ PBL_Redes-Sensores2/
 │   ├── Dockerfile
 │   ├── docker-compose.yml
 │   └── main.go
-└── client/
+├── client/
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   └── main.go
+└── admin/
     ├── Dockerfile
     ├── docker-compose.yml
     └── main.go

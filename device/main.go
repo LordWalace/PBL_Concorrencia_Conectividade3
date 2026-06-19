@@ -1,25 +1,15 @@
 package main
 
 import (
-	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"log"
-	"math/big"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
 type Message struct {
@@ -287,7 +277,7 @@ func sendHeartbeat() error {
 func migrateGateway(controlAddr string) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	currentState := currentStatus()
-	
+
 	// Correção: mutex proteje variaveis globais durante leitura na migracao
 	stateMutex.Lock()
 	activeDuringMigration := missionActive
@@ -518,128 +508,32 @@ func currentMissionInfo() string {
 		}
 		return fmt.Sprintf("em missão até %s", missionEnd.Format(time.RFC3339))
 	}
-	return "sem missão"
+	return "sem miss�o"
 }
 
-// --- QUIC TRANSPORT ABSTRACTION ---
+// --- TCP TRANSPORT ABSTRACTION ---
 
 func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"hormuz-quic"},
-	}
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, nil)
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return nil, fmt.Errorf("quic dial error: %w", err)
+		return nil, fmt.Errorf("tcp dial error: %w", err)
 	}
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		conn.CloseWithError(0, "failed to open stream")
-		return nil, fmt.Errorf("quic stream error: %w", err)
-	}
-	return &quicConnWrapper{Stream: stream, conn: conn}, nil
+	return conn, nil
 }
 
-type transportListener struct {
-	quicListener *quic.Listener
-	acceptChan   chan net.Conn
-	errChan      chan error
-}
-
-func listenTransport(addr string) (*transportListener, error) {
-	tlsConf := generateTLSConfig()
-	l, err := quic.ListenAddr(addr, tlsConf, nil)
+func listenTransport(addr string) (net.Listener, error) {
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	tl := &transportListener{
-		quicListener: l,
-		acceptChan:   make(chan net.Conn),
-		errChan:      make(chan error),
-	}
-	go tl.acceptLoop()
-	return tl, nil
-}
-
-func (tl *transportListener) acceptLoop() {
-	for {
-		conn, err := tl.quicListener.Accept(context.Background())
-		if err != nil {
-			tl.errChan <- err
-			return
-		}
-		go func(c quic.Connection) {
-			for {
-				stream, err := c.AcceptStream(context.Background())
-				if err != nil {
-					return
-				}
-				tl.acceptChan <- &quicConnWrapper{Stream: stream, conn: c}
-			}
-		}(conn)
-	}
-}
-
-func (tl *transportListener) Accept() (net.Conn, error) {
-	select {
-	case conn := <-tl.acceptChan:
-		return conn, nil
-	case err := <-tl.errChan:
-		return nil, err
-	}
-}
-
-func (tl *transportListener) Close() error {
-	return tl.quicListener.Close()
-}
-
-func (tl *transportListener) Addr() net.Addr {
-	return tl.quicListener.Addr()
-}
-
-type quicConnWrapper struct {
-	quic.Stream
-	conn quic.Connection
-}
-
-func (w *quicConnWrapper) LocalAddr() net.Addr  { return w.conn.LocalAddr() }
-func (w *quicConnWrapper) RemoteAddr() net.Addr { return w.conn.RemoteAddr() }
-func (w *quicConnWrapper) Close() error         { return w.Stream.Close() }
-
-func generateTLSConfig() *tls.Config {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		panic(err)
-	}
-	template := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{Organization: []string{"Hormuz"}},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		panic(err)
-	}
-	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"hormuz-quic"}}
+	return l, nil
 }
 
 /******************************************************************************************
 
 Autor: Walace de Jesus Venas
 Componente Curricular: TEC502 MI- CONCORRÊNCIA E CONECTIVIDADE
-Concluído em: 14/05/2026
+Concluído em: 18/06/2026
 Declaro que este código foi elaborado por mim de forma individual e não contêm nenhum
 trecho de código de outro colega ou de outro autor, tais como provindos de livros e
 apostilas, e páginas ou documentos eletrônicos da Internet. Qualquer trecho de código
@@ -648,4 +542,3 @@ do código, e estou ciente que estes trechos não serão considerados para fins 
 Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-Agrawala.
 
 *******************************************************************************************/
-

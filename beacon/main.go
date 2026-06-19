@@ -1,26 +1,15 @@
 package main
 
 import (
-	"context"
-	crand "crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"log"
-	"math/big"
 	"math/rand"
 	"net"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
 type OccurrenceOption struct {
@@ -140,8 +129,6 @@ func generateOccurrencesLoop(r *rand.Rand, beaconID, primaryGateway string, back
 	}
 }
 
-
-
 // sendWithFailover realiza envio de alerta para gateway primario e alterna para backups se houver falha.
 func sendWithFailover(msg Message, primaryGateway string, backupGateways []string) {
 	payload, err := json.Marshal(msg)
@@ -164,8 +151,6 @@ func sendWithFailover(msg Message, primaryGateway string, backupGateways []strin
 		time.Sleep(2 * time.Second)
 	}
 }
-
-
 
 // trySendToGateway tenta enviar payload TCP ao gateway e detecta falha de conexao.
 func trySendToGateway(addr string, payload []byte) bool {
@@ -200,174 +185,20 @@ Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-
 
 *******************************************************************************************/
 
-// --- QUIC TRANSPORT ABSTRACTION ---
+// --- TCP TRANSPORT ABSTRACTION ---
 
-var (
-	quicConns = make(map[string]quic.Connection)
-	quicMutex sync.Mutex
-)
-
-func getQuicConnection(addr string, timeout time.Duration) (quic.Connection, error) {
-	quicMutex.Lock()
-	if conn, ok := quicConns[addr]; ok {
-		quicMutex.Unlock()
-		return conn, nil
-	}
-	quicMutex.Unlock()
-
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"hormuz-quic"},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	quicConfig := &quic.Config{
-		KeepAlivePeriod: 10 * time.Second,
-	}
-
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConfig)
+func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return nil, fmt.Errorf("quic dial error: %w", err)
+		return nil, fmt.Errorf("tcp dial error: %w", err)
 	}
-
-	quicMutex.Lock()
-	if existing, ok := quicConns[addr]; ok {
-		quicMutex.Unlock()
-		conn.CloseWithError(0, "")
-		return existing, nil
-	}
-	quicConns[addr] = conn
-	quicMutex.Unlock()
-
 	return conn, nil
 }
 
-func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
-	conn, err := getQuicConnection(addr, timeout)
+func listenTransport(addr string) (net.Listener, error) {
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		quicMutex.Lock()
-		delete(quicConns, addr)
-		quicMutex.Unlock()
-
-		conn, err = getQuicConnection(addr, timeout)
-		if err != nil {
-			return nil, err
-		}
-
-		ctx2, cancel2 := context.WithTimeout(context.Background(), timeout)
-		defer cancel2()
-		stream, err = conn.OpenStreamSync(ctx2)
-		if err != nil {
-			return nil, fmt.Errorf("quic stream error após reconexão: %w", err)
-		}
-	}
-
-	return &quicConnWrapper{Stream: stream, conn: conn}, nil
+	return l, nil
 }
-
-type transportListener struct {
-	quicListener *quic.Listener
-	acceptChan   chan net.Conn
-	errChan      chan error
-}
-
-func listenTransport(addr string) (*transportListener, error) {
-	tlsConf := generateTLSConfig()
-	l, err := quic.ListenAddr(addr, tlsConf, nil)
-	if err != nil {
-		return nil, err
-	}
-	tl := &transportListener{
-		quicListener: l,
-		acceptChan:   make(chan net.Conn),
-		errChan:      make(chan error),
-	}
-	go tl.acceptLoop()
-	return tl, nil
-}
-
-func (tl *transportListener) acceptLoop() {
-	for {
-		conn, err := tl.quicListener.Accept(context.Background())
-		if err != nil {
-			tl.errChan <- err
-			return
-		}
-		go func(c quic.Connection) {
-			for {
-				stream, err := c.AcceptStream(context.Background())
-				if err != nil {
-					return
-				}
-				tl.acceptChan <- &quicConnWrapper{Stream: stream, conn: c}
-			}
-		}(conn)
-	}
-}
-
-func (tl *transportListener) Accept() (net.Conn, error) {
-	select {
-	case conn := <-tl.acceptChan:
-		return conn, nil
-	case err := <-tl.errChan:
-		return nil, err
-	}
-}
-
-func (tl *transportListener) Close() error {
-	return tl.quicListener.Close()
-}
-
-func (tl *transportListener) Addr() net.Addr {
-	return tl.quicListener.Addr()
-}
-
-type quicConnWrapper struct {
-	quic.Stream
-	conn quic.Connection
-}
-
-func (w *quicConnWrapper) LocalAddr() net.Addr  { return w.conn.LocalAddr() }
-func (w *quicConnWrapper) RemoteAddr() net.Addr { return w.conn.RemoteAddr() }
-func (w *quicConnWrapper) Close() error {
-	w.Stream.CancelRead(0)
-	return w.Stream.Close()
-}
-
-func generateTLSConfig() *tls.Config {
-	key, err := rsa.GenerateKey(crand.Reader, 2048)
-	if err != nil {
-		panic(err)
-	}
-	template := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{Organization: []string{"Hormuz"}},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	certDER, err := x509.CreateCertificate(crand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		panic(err)
-	}
-	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"hormuz-quic"}}
-}
-

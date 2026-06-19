@@ -2,17 +2,9 @@ package main
 
 import (
 	"bufio"
-	"context"
-	crand "crypto/rand"
-	"crypto/rsa"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"log"
-	"math/big"
 	"math/rand"
 	"net"
 	"os"
@@ -21,8 +13,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/quic-go/quic-go"
 )
 
 type Message struct {
@@ -93,7 +83,7 @@ func mustEnv(key string) string {
 
 func getAvailableGatewayConn(gateways map[string]string) (net.Conn, string, error) {
 	for name, addr := range gateways {
-		conn, err := dialTransport(addr, 3*time.Second)
+		conn, err := dialTransport(addr, 1*time.Second)
 		if err == nil {
 			return conn, name, nil
 		}
@@ -248,7 +238,7 @@ func solveProblemMenu(reader *bufio.Reader, gateways map[string]string) {
 		}
 		json.NewEncoder(conn).Encode(req)
 
-		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		var rep Message
 		err = json.NewDecoder(conn).Decode(&rep)
 		conn.Close()
@@ -339,7 +329,7 @@ func dispatchClientMission(reader *bufio.Reader, selected AlertRequest, gateways
 	defer conn.Close()
 	json.NewEncoder(conn).Encode(msg)
 
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	var ack Message
 	json.NewDecoder(conn).Decode(&ack)
 
@@ -365,7 +355,7 @@ func printStatus(sectors []string, gateways map[string]string) {
 		go func(idx int, setor string) {
 			defer wg.Done()
 			addr := gateways[setor]
-			conn, err := dialTransport(addr, 5*time.Second)
+			conn, err := dialTransport(addr, 1*time.Second)
 			if err != nil {
 				sectorResults[idx] = fmt.Sprintf("[Setor %s] OFFLINE (dial err: %v)", setor, err)
 				return
@@ -378,7 +368,7 @@ func printStatus(sectors []string, gateways map[string]string) {
 			}
 
 			var reply Message
-			conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 			if err := json.NewDecoder(conn).Decode(&reply); err != nil {
 				sectorResults[idx] = fmt.Sprintf("[Setor %s] OFFLINE (decode err: %v)", setor, err)
 				return
@@ -535,7 +525,7 @@ func viewEventLog(reader *bufio.Reader, sectors []string, gateways map[string]st
 
 	for _, sector := range sectors {
 		addr := gateways[sector]
-		conn, err := dialTransport(addr, 5*time.Second)
+		conn, err := dialTransport(addr, 1*time.Second)
 		if err != nil {
 			fmt.Printf("[Setor %s] OFFLINE\n", sector)
 			continue
@@ -549,7 +539,7 @@ func viewEventLog(reader *bufio.Reader, sectors []string, gateways map[string]st
 		}
 
 		var reply Message
-		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		if err := json.NewDecoder(conn).Decode(&reply); err != nil {
 			fmt.Printf("[Setor %s] Falha ao receber eventos: %v\n", sector, err)
 			conn.Close()
@@ -622,7 +612,7 @@ func sendWithFallback(msg Message, initialSector string, sectors []string, gatew
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		for _, sector := range order {
 			target := gateways[sector]
-			conn, err := dialTransport(target, 3*time.Second)
+			conn, err := dialTransport(target, 1*time.Second)
 			if err != nil {
 				continue
 			}
@@ -630,7 +620,7 @@ func sendWithFallback(msg Message, initialSector string, sectors []string, gatew
 				conn.Close()
 				continue
 			}
-			conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 			var ack Message
 			if err := json.NewDecoder(conn).Decode(&ack); err != nil {
 				conn.Close()
@@ -697,176 +687,22 @@ func clearMenuLines(linhas int) {
 	fmt.Printf("\033[%dA\033[J", linhas)
 }
 
-// --- QUIC TRANSPORT ABSTRACTION ---
+// --- TCP TRANSPORT ABSTRACTION ---
 
-var (
-	quicConns = make(map[string]quic.Connection)
-	quicMutex sync.Mutex
-)
-
-func getQuicConnection(addr string, timeout time.Duration) (quic.Connection, error) {
-	quicMutex.Lock()
-	if conn, ok := quicConns[addr]; ok {
-		quicMutex.Unlock()
-		return conn, nil
-	}
-	quicMutex.Unlock()
-
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"hormuz-quic"},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	quicConfig := &quic.Config{
-		KeepAlivePeriod: 10 * time.Second,
-	}
-
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConfig)
+func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
-		return nil, fmt.Errorf("quic dial error: %w", err)
+		return nil, fmt.Errorf("tcp dial error: %w", err)
 	}
-
-	quicMutex.Lock()
-	if existing, ok := quicConns[addr]; ok {
-		quicMutex.Unlock()
-		conn.CloseWithError(0, "")
-		return existing, nil
-	}
-	quicConns[addr] = conn
-	quicMutex.Unlock()
-
 	return conn, nil
 }
 
-func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
-	conn, err := getQuicConnection(addr, timeout)
+func listenTransport(addr string) (net.Listener, error) {
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		// A conexão pode ter caído. Remove do cache e tenta reconectar 1 vez.
-		quicMutex.Lock()
-		delete(quicConns, addr)
-		quicMutex.Unlock()
-
-		conn, err = getQuicConnection(addr, timeout)
-		if err != nil {
-			return nil, err
-		}
-
-		ctx2, cancel2 := context.WithTimeout(context.Background(), timeout)
-		defer cancel2()
-		stream, err = conn.OpenStreamSync(ctx2)
-		if err != nil {
-			return nil, fmt.Errorf("quic stream error após reconexão: %w", err)
-		}
-	}
-
-	return &quicConnWrapper{Stream: stream, conn: conn}, nil
-}
-
-type transportListener struct {
-	quicListener *quic.Listener
-	acceptChan   chan net.Conn
-	errChan      chan error
-}
-
-func listenTransport(addr string) (*transportListener, error) {
-	tlsConf := generateTLSConfig()
-	l, err := quic.ListenAddr(addr, tlsConf, nil)
-	if err != nil {
-		return nil, err
-	}
-	tl := &transportListener{
-		quicListener: l,
-		acceptChan:   make(chan net.Conn),
-		errChan:      make(chan error),
-	}
-	go tl.acceptLoop()
-	return tl, nil
-}
-
-func (tl *transportListener) acceptLoop() {
-	for {
-		conn, err := tl.quicListener.Accept(context.Background())
-		if err != nil {
-			tl.errChan <- err
-			return
-		}
-		go func(c quic.Connection) {
-			for {
-				stream, err := c.AcceptStream(context.Background())
-				if err != nil {
-					return
-				}
-				tl.acceptChan <- &quicConnWrapper{Stream: stream, conn: c}
-			}
-		}(conn)
-	}
-}
-
-func (tl *transportListener) Accept() (net.Conn, error) {
-	select {
-	case conn := <-tl.acceptChan:
-		return conn, nil
-	case err := <-tl.errChan:
-		return nil, err
-	}
-}
-
-func (tl *transportListener) Close() error {
-	return tl.quicListener.Close()
-}
-
-func (tl *transportListener) Addr() net.Addr {
-	return tl.quicListener.Addr()
-}
-
-type quicConnWrapper struct {
-	quic.Stream
-	conn quic.Connection
-}
-
-func (w *quicConnWrapper) LocalAddr() net.Addr  { return w.conn.LocalAddr() }
-func (w *quicConnWrapper) RemoteAddr() net.Addr { return w.conn.RemoteAddr() }
-func (w *quicConnWrapper) Close() error {
-	w.Stream.CancelRead(0)
-	return w.Stream.Close()
-}
-
-func generateTLSConfig() *tls.Config {
-	key, err := rsa.GenerateKey(crand.Reader, 2048)
-	if err != nil {
-		panic(err)
-	}
-	template := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{Organization: []string{"Hormuz"}},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	certDER, err := x509.CreateCertificate(crand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		panic(err)
-	}
-	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{"hormuz-quic"}}
+	return l, nil
 }
 
 /******************************************************************************************
