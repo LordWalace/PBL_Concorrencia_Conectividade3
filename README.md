@@ -1,6 +1,6 @@
-# Sistema HORMUZ
+﻿# Sistema HORMUZ + LEDGER Distribuído
 
-Um sistema distribuido de coordenação de drones para quatro setores (Norte, Sul, Leste, Oeste) com foco em tolerância a falhas, exclusão mútua distribuída e redundância de rede.
+Um sistema distribuido de coordenação de drones para quatro setores (Norte, Sul, Leste, Oeste) com foco em tolerância a falhas, exclusão mútua distribuída e redundância de rede. Inclui ledger distribuído para controle de economia de tokens e prestação de serviços.
 
 ## Sumario
 
@@ -253,7 +253,7 @@ O cliente trata gateways offline de forma silenciosa: ele exibe `OFFLINE` quando
 
 ## Segurança do Ledger Distribuído
 
-A economia de Tokens do Consórcio Hormuz é gerenciada por um Ledger Distribuído (Livro-Razão) interno ao cluster de Gateways, protegido pelas seguintes garantias:
+A economia de Tokens do Consórcio Hormuz é gerenciada por um Ledger Distribuído (Livro-Razão) interno à malha de gateways, protegido pelas seguintes garantias:
 
 1. **Criptografia Hash (Blockchain):** Cada bloco (`LedgerRecord`) inserido no registro gera uma assinatura SHA-256 única baseada no seu conteúdo combinada com o `Hash` do bloco anterior. Isso cria uma cadeia imutável, onde a adulteração de um registro passaria a invalidar todos os blocos subsequentes.
 2. **Prevenção de Gasto-Duplo via Ricart-Agrawala:** Qualquer transação financeira (pagamento de missão, transferência ou emissão de moedas) requer que o Gateway adquira um bloqueio exclusivo global (`__economy__`) utilizando o algoritmo de Ricart-Agrawala. Isso previne condições de corrida onde duas empresas tentariam gastar o mesmo Token ao mesmo tempo.
