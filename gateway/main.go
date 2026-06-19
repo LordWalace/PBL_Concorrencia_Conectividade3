@@ -173,8 +173,10 @@ type economyOp struct {
 
 type PriorityQueue []*AlertRequest
 
+// Len executa as rotinas de controle e processamento especificas desta rotina.
 func (pq PriorityQueue) Len() int { return len(pq) }
 
+// Less executa as rotinas de controle e processamento especificas desta rotina.
 func (pq PriorityQueue) Less(i, j int) bool {
 	if pq[i].Priority != pq[j].Priority {
 		return pq[i].Priority > pq[j].Priority
@@ -188,10 +190,13 @@ func (pq PriorityQueue) Less(i, j int) bool {
 	return pq[i].GatewayID < pq[j].GatewayID
 }
 
+// Swap executa as rotinas de controle e processamento especificas desta rotina.
 func (pq PriorityQueue) Swap(i, j int) { pq[i], pq[j] = pq[j], pq[i] }
 
+// Push executa as rotinas de controle e processamento especificas desta rotina.
 func (pq *PriorityQueue) Push(x interface{}) { *pq = append(*pq, x.(*AlertRequest)) }
 
+// Pop executa as rotinas de controle e processamento especificas desta rotina.
 func (pq *PriorityQueue) Pop() interface{} {
 	old := *pq
 	n := len(old)
@@ -201,6 +206,7 @@ func (pq *PriorityQueue) Pop() interface{} {
 	return item
 }
 
+// nextReadyRequestIndex executa as rotinas de controle e processamento especificas desta rotina.
 func nextReadyRequestIndex() int {
 	now := time.Now()
 	best := -1
@@ -264,6 +270,7 @@ var (
 	economyOpPending      = make(chan economyOp, 64)
 )
 
+// mustEnv valida a existencia do parametro vital ou aborta a execucao.
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -272,6 +279,7 @@ func mustEnv(key string) string {
 	return v
 }
 
+// normalizeDroneID executa as rotinas de controle e processamento especificas desta rotina.
 func normalizeDroneID(droneID string) string {
 	if strings.HasPrefix(droneID, "Drone_") {
 		droneID = strings.TrimPrefix(droneID, "Drone_")
@@ -286,6 +294,7 @@ func normalizeDroneID(droneID string) string {
 	return strings.ReplaceAll(droneID, "_", "-")
 }
 
+// markStateReady marca ou atualiza o status interno do sistema.
 func markStateReady() {
 	stateMutex.Lock()
 	if !stateSynced {
@@ -296,6 +305,7 @@ func markStateReady() {
 	notifyQueueProcessor()
 }
 
+// notifyQueueProcessor executa as rotinas de controle e processamento especificas desta rotina.
 func notifyQueueProcessor() {
 	select {
 	case queueNotify <- struct{}{}:
@@ -303,6 +313,7 @@ func notifyQueueProcessor() {
 	}
 }
 
+// isDroneUnavailable verifica a condicao e retorna o estado booleano.
 func isDroneUnavailable(droneID string) bool {
 	if until, ok := droneUnavailableUntil[droneID]; ok {
 		return time.Now().Before(until)
@@ -310,10 +321,12 @@ func isDroneUnavailable(droneID string) bool {
 	return false
 }
 
+// isRequestClaimed verifica a condicao e retorna o estado booleano.
 func isRequestClaimed(requestID string) bool {
 	return requestID != "" && (seenAlerts[requestID] || claimedAlerts[requestID])
 }
 
+// markAlertClaimed marca ou atualiza o status interno do sistema.
 func markAlertClaimed(requestID string) {
 	if requestID == "" {
 		return
@@ -322,6 +335,7 @@ func markAlertClaimed(requestID string) {
 	seenAlerts[requestID] = true
 }
 
+// removeAlertFromQueue executa as rotinas de controle e processamento especificas desta rotina.
 func removeAlertFromQueue(requestID string) {
 	for i, req := range reqQueue {
 		if req.RequestID == requestID {
@@ -331,12 +345,14 @@ func removeAlertFromQueue(requestID string) {
 	}
 }
 
+// ensureRequestID executa as rotinas de controle e processamento especificas desta rotina.
 func ensureRequestID(msg *Message) {
 	if msg.RequestID == "" {
 		msg.RequestID = fmt.Sprintf("%s:%d:%d", gatewayID, time.Now().UnixNano(), tickLamport(msg.Lamport))
 	}
 }
 
+// enqueueAlertFromPeer adiciona o item na fila de processamento apropriada.
 func enqueueAlertFromPeer(req AlertRequest) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -368,6 +384,7 @@ func enqueueAlertFromPeer(req AlertRequest) {
 	log.Printf("[GATEWAY/%s] [R-A] Alerta replicado recebido: %s prioridade %d", gatewayID, req.Occurrence, req.Priority)
 }
 
+// mergeQueueFromStateSync executa as rotinas de controle e processamento especificas desta rotina.
 func mergeQueueFromStateSync(queue []AlertRequest) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -388,6 +405,7 @@ func mergeQueueFromStateSync(queue []AlertRequest) {
 	}
 }
 
+// init prepara as variaveis e inicializa configuracoes antes do main.
 func init() {
 	gatewayID = mustEnv("GATEWAY_ID")
 	gatewayHost = mustEnv("GATEWAY_HOST")
@@ -396,6 +414,7 @@ func init() {
 	peerPort = mustEnv("GATEWAY_TCP_PEER_PORT")
 }
 
+// main inicializa o servico, as dependencias e os workers principais.
 func main() {
 	heap.Init(&reqQueue)
 
@@ -447,6 +466,7 @@ func main() {
 	select {}
 }
 
+// startServer inicia o loop de tarefas ou processo em background.
 func startServer(host, port string, handler func(net.Conn)) {
 	addr := fmt.Sprintf("%s:%s", host, port)
 	listener, err := listenTransport(addr)
@@ -463,6 +483,7 @@ func startServer(host, port string, handler func(net.Conn)) {
 	}
 }
 
+// handlePeerConnection processa a requisicao e executa a logica correspondente.
 func handlePeerConnection(conn net.Conn) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -519,6 +540,7 @@ func handlePeerConnection(conn net.Conn) {
 	}
 }
 
+// handleRegConnection processa a requisicao e executa a logica correspondente.
 func handleRegConnection(conn net.Conn) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -558,6 +580,7 @@ func handleRegConnection(conn net.Conn) {
 	}
 }
 
+// handleClientConnection processa a requisicao e executa a logica correspondente.
 func handleClientConnection(conn net.Conn) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -635,6 +658,7 @@ func handleClientConnection(conn net.Conn) {
 	}
 }
 
+// handleDeviceRegistration processa a requisicao e executa a logica correspondente.
 func handleDeviceRegistration(msg Message) {
 	stateMutex.Lock()
 	drone, exists := drones[msg.DroneID]
@@ -657,6 +681,7 @@ func handleDeviceRegistration(msg Message) {
 	log.Printf("[GATEWAY/%s] [DRONE] Drone %s registrado. Status: %s", gatewayID, droneName, msg.Status)
 }
 
+// handleDroneHeartbeat processa a requisicao e executa a logica correspondente.
 func handleDroneHeartbeat(msg Message, conn net.Conn) {
 	stateMutex.Lock()
 	drone, exists := drones[msg.DroneID]
@@ -691,6 +716,7 @@ func handleDroneHeartbeat(msg Message, conn net.Conn) {
 	}
 }
 
+// sendStatusRep realiza o envio da mensagem ou pacote pela rede.
 func sendStatusRep(conn net.Conn) {
 	stateMutex.Lock()
 	payload := map[string]string{}
@@ -745,6 +771,7 @@ func sendStatusRep(conn net.Conn) {
 	}
 }
 
+// queuePreviewItems executa as rotinas de controle e processamento especificas desta rotina.
 func queuePreviewItems(limit int) []AlertRequest {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -764,6 +791,7 @@ func queuePreviewItems(limit int) []AlertRequest {
 	return preview
 }
 
+// handleProblemsReq processa a requisicao e executa a logica correspondente.
 func handleProblemsReq(msg Message, conn net.Conn) {
 	offset := 0
 	limit := 5
@@ -794,6 +822,7 @@ func handleProblemsReq(msg Message, conn net.Conn) {
 	}
 }
 
+// queuePreviewItemsOffset executa as rotinas de controle e processamento especificas desta rotina.
 func queuePreviewItemsOffset(offset, limit int) []AlertRequest {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -817,6 +846,7 @@ func queuePreviewItemsOffset(offset, limit int) []AlertRequest {
 	return preview
 }
 
+// sendEventsRep realiza o envio da mensagem ou pacote pela rede.
 func sendEventsRep(conn net.Conn, msg Message) {
 	count := 5
 	if msg.Payload != nil {
@@ -837,6 +867,7 @@ func sendEventsRep(conn net.Conn, msg Message) {
 	json.NewEncoder(conn).Encode(Message{Type: MsgEventsRep, Payload: payload})
 }
 
+// handleRARequest processa a requisicao e executa a logica correspondente.
 func handleRARequest(msg Message) {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -874,6 +905,7 @@ func handleRARequest(msg Message) {
 	go sendDirect(msg.GatewayID, reply)
 }
 
+// handleRAReply processa a requisicao e executa a logica correspondente.
 func handleRAReply(msg Message) {
 	stateMutex.Lock()
 	if !requestingCS[msg.DroneID] {
@@ -891,6 +923,7 @@ func handleRAReply(msg Message) {
 	}
 }
 
+// handleRARelease processa a requisicao e executa a logica correspondente.
 func handleRARelease(msg Message) {
 	stateMutex.Lock()
 	if drone, ok := drones[msg.DroneID]; ok {
@@ -909,6 +942,7 @@ func handleRARelease(msg Message) {
 	log.Printf("[GATEWAY/%s] [R-A] Drone %s liberado por %s", gatewayID, msg.DroneID, msg.GatewayID)
 }
 
+// handleAlertClaim processa a requisicao e executa a logica correspondente.
 func handleAlertClaim(msg Message) {
 	if msg.RequestID == "" {
 		return
@@ -925,6 +959,7 @@ func handleAlertClaim(msg Message) {
 	log.Printf("[GATEWAY/%s] [R-A] Alerta %s assumido por %s", gatewayID, msg.RequestID, msg.GatewayID)
 }
 
+// releaseCS executa as rotinas de controle e processamento especificas desta rotina.
 func releaseCS(droneID string, available bool) {
 	stateMutex.Lock()
 	deferredList := deferred[droneID]
@@ -964,6 +999,7 @@ func releaseCS(droneID string, available bool) {
 	}
 }
 
+// processQueueLoop executa as rotinas de controle e processamento especificas desta rotina.
 func processQueueLoop() {
 	for {
 		select {
@@ -1021,6 +1057,7 @@ func processQueueLoop() {
 	}
 }
 
+// waitForReplies executa as rotinas de controle e processamento especificas desta rotina.
 func waitForReplies(droneID string, msg Message) {
 	stateMutex.Lock()
 	if !requestingCS[droneID] {
@@ -1130,6 +1167,7 @@ func waitForReplies(droneID string, msg Message) {
 	stateMutex.Unlock()
 }
 
+// dispatchDrone executa as rotinas de controle e processamento especificas desta rotina.
 func dispatchDrone(droneID string) {
 	stateMutex.Lock()
 	drone, ok := drones[droneID]
@@ -1171,6 +1209,7 @@ func dispatchDrone(droneID string) {
 	}
 }
 
+// acquireCriticalSection executa as rotinas de controle e processamento especificas desta rotina.
 func acquireCriticalSection(droneID string, msg Message) {
 	stateMutex.Lock()
 	if droneID == economyDroneID {
@@ -1193,6 +1232,7 @@ func acquireCriticalSection(droneID string, msg Message) {
 	go dispatchDrone(droneID)
 }
 
+// handleDroneFailed processa a requisicao e executa a logica correspondente.
 func handleDroneFailed(msg Message) {
 	stateMutex.Lock()
 	drone, ok := drones[msg.DroneID]
@@ -1214,6 +1254,7 @@ func handleDroneFailed(msg Message) {
 	}
 }
 
+// handleLocalDroneFailure processa a requisicao e executa a logica correspondente.
 func handleLocalDroneFailure(droneID, reason string) {
 	stateMutex.Lock()
 	drone, ok := drones[droneID]
@@ -1270,6 +1311,7 @@ func handleLocalDroneFailure(droneID, reason string) {
 	}
 }
 
+// syncStateOnStart sincroniza os dados locais com a malha distribuida.
 func syncStateOnStart() {
 	time.Sleep(2 * time.Second)
 
@@ -1294,6 +1336,7 @@ func syncStateOnStart() {
 	markStateReady()
 }
 
+// syncStateFromPeer sincroniza os dados locais com a malha distribuida.
 func syncStateFromPeer(peerID string, replaceState bool) error {
 	stateMutex.Lock()
 	addr, ok := peerAddrsByID[peerID]
@@ -1342,6 +1385,7 @@ func syncStateFromPeer(peerID string, replaceState bool) error {
 	return nil
 }
 
+// sendStateSync realiza o envio da mensagem ou pacote pela rede.
 func sendStateSync(conn net.Conn) {
 	stateMutex.Lock()
 	payload := make(map[string]string)
@@ -1375,6 +1419,7 @@ func sendStateSync(conn net.Conn) {
 	}
 }
 
+// receiveStateSync executa as rotinas de controle e processamento especificas desta rotina.
 func receiveStateSync(msg Message) {
 	stateMutex.Lock()
 	for key, value := range msg.Payload {
@@ -1440,6 +1485,7 @@ func receiveStateSync(msg Message) {
 	log.Printf("[GATEWAY/%s] [SYNC] Estado sincronizado recebido de %s", gatewayID, msg.GatewayID)
 }
 
+// monitorLocalDroneHeartbeats executa as rotinas de controle e processamento especificas desta rotina.
 func monitorLocalDroneHeartbeats() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -1469,6 +1515,7 @@ func monitorLocalDroneHeartbeats() {
 	}
 }
 
+// markPeerOffline marca ou atualiza o status interno do sistema.
 func markPeerOffline(peerID string, duration time.Duration, reason string) {
 	stateMutex.Lock()
 	peerOfflineUntil[peerID] = time.Now().Add(duration)
@@ -1479,6 +1526,7 @@ func markPeerOffline(peerID string, duration time.Duration, reason string) {
 	}
 }
 
+// enqueuePendingPeerMessage adiciona o item na fila de processamento apropriada.
 func enqueuePendingPeerMessage(peerID string, msg Message) {
 	pendingPeerMutex.Lock()
 	deferred := pendingPeerMsgs[peerID]
@@ -1486,6 +1534,7 @@ func enqueuePendingPeerMessage(peerID string, msg Message) {
 	pendingPeerMutex.Unlock()
 }
 
+// sendPendingPeerMessages realiza o envio da mensagem ou pacote pela rede.
 func sendPendingPeerMessages(peerID string) {
 	pendingPeerMutex.Lock()
 	msgs := pendingPeerMsgs[peerID]
@@ -1500,6 +1549,7 @@ func sendPendingPeerMessages(peerID string) {
 	}
 }
 
+// broadcastPeerMsg executa as rotinas de controle e processamento especificas desta rotina.
 func broadcastPeerMsg(msg Message) {
 	for _, peerID := range peerIDs {
 		stateMutex.Lock()
@@ -1519,10 +1569,12 @@ func broadcastPeerMsg(msg Message) {
 	}
 }
 
+// sendDirect realiza o envio da mensagem ou pacote pela rede.
 func sendDirect(targetGateway string, msg Message) error {
 	return sendDirectWithRetry(targetGateway, msg, 3)
 }
 
+// sendDirectOnce realiza o envio da mensagem ou pacote pela rede.
 func sendDirectOnce(targetGateway string, msg Message) error {
 	addr, ok := peerAddrsByID[targetGateway]
 	if !ok {
@@ -1552,6 +1604,7 @@ func sendDirectOnce(targetGateway string, msg Message) error {
 	return nil
 }
 
+// sendDirectWithRetry realiza o envio da mensagem ou pacote pela rede.
 func sendDirectWithRetry(targetGateway string, msg Message, maxAttempts int) error {
 	addr, ok := peerAddrsByID[targetGateway]
 	if !ok {
@@ -1597,6 +1650,7 @@ func sendDirectWithRetry(targetGateway string, msg Message, maxAttempts int) err
 	return lastErr
 }
 
+// shouldPeerAck executa as rotinas de controle e processamento especificas desta rotina.
 func shouldPeerAck(msgType string) bool {
 	switch msgType {
 	case MsgRequest, MsgReply, MsgRelease, MsgAlert, MsgDroneFailed, MsgDeviceReg, MsgPeerHeartbeat:
@@ -1606,11 +1660,13 @@ func shouldPeerAck(msgType string) bool {
 	}
 }
 
+// sendPeerAck realiza o envio da mensagem ou pacote pela rede.
 func sendPeerAck(conn net.Conn, msg Message) {
 	ack := Message{Type: MsgAck, Status: "OK", RequestID: msg.RequestID, GatewayID: gatewayID, Lamport: tickLamport(msg.Lamport)}
 	json.NewEncoder(conn).Encode(ack)
 }
 
+// markPeerOnline marca ou atualiza o status interno do sistema.
 func markPeerOnline(peerID string) {
 	stateMutex.Lock()
 	_, wasOffline := peerOfflineUntil[peerID]
@@ -1630,6 +1686,7 @@ func markPeerOnline(peerID string) {
 	}
 }
 
+// startPeerHealthMonitor inicia o loop de tarefas ou processo em background.
 func startPeerHealthMonitor() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -1667,6 +1724,7 @@ func startPeerHealthMonitor() {
 	}
 }
 
+// getReplyChannel obtem e retorna a informacao solicitada.
 func getReplyChannel(droneID, peerID string) chan struct{} {
 	replyChannelMutex.Lock()
 	defer replyChannelMutex.Unlock()
@@ -1676,12 +1734,14 @@ func getReplyChannel(droneID, peerID string) chan struct{} {
 	return nil
 }
 
+// cleanupReplyChannels executa as rotinas de controle e processamento especificas desta rotina.
 func cleanupReplyChannels(droneID string) {
 	replyChannelMutex.Lock()
 	delete(replyChannels, droneID)
 	replyChannelMutex.Unlock()
 }
 
+// tickLamport executa as rotinas de controle e processamento especificas desta rotina.
 func tickLamport(recv int) int {
 	lamportMutex.Lock()
 	defer lamportMutex.Unlock()
@@ -1692,6 +1752,7 @@ func tickLamport(recv int) int {
 	return lamportClock
 }
 
+// updateLamport executa as rotinas de controle e processamento especificas desta rotina.
 func updateLamport(recv int) {
 	lamportMutex.Lock()
 	defer lamportMutex.Unlock()
@@ -1701,6 +1762,7 @@ func updateLamport(recv int) {
 	lamportClock++
 }
 
+// logEvent executa as rotinas de controle e processamento especificas desta rotina.
 func logEvent(event string) {
 	eventMutex.Lock()
 	defer eventMutex.Unlock()
@@ -1712,14 +1774,17 @@ func logEvent(event string) {
 
 // --- LEDGER / ECONOMY / TRANSPORT ---
 
+// dialPeerTransport estabelece uma nova conexao de rede TCP ou QUIC.
 func dialPeerTransport(addr string) (net.Conn, error) {
 	return dialTransport(addr, 5*time.Second) // Longer timeout for QUIC handshake over local Docker network
 }
 
+// ledgerFilePath executa as rotinas de controle e processamento especificas desta rotina.
 func ledgerFilePath() string {
 	return fmt.Sprintf("%s_ledger.json", gatewayID)
 }
 
+// loadLedgerFromDisk executa as rotinas de controle e processamento especificas desta rotina.
 func loadLedgerFromDisk() {
 	data, err := os.ReadFile(ledgerFilePath())
 	if err != nil {
@@ -1759,6 +1824,7 @@ func loadLedgerFromDisk() {
 	log.Printf("[GATEWAY/%s] [LEDGER] Restaurado com %d registros e validado com sucesso", gatewayID, len(ledgerRecords))
 }
 
+// validateLedgerRecords executa as rotinas de controle e processamento especificas desta rotina.
 func validateLedgerRecords(records []LedgerRecord) error {
 	for i, rec := range records {
 		expectedPrevHash := "genesis"
@@ -1793,6 +1859,7 @@ func validateLedgerRecords(records []LedgerRecord) error {
 	return nil
 }
 
+// persistLedgerToDisk executa as rotinas de controle e processamento especificas desta rotina.
 func persistLedgerToDisk() {
 	ledgerMutex.RLock()
 
@@ -1841,6 +1908,7 @@ func persistLedgerToDisk() {
 	_ = os.Rename(tmp, ledgerFilePath())
 }
 
+// rebuildCompanyTokenIndexLocked executa as rotinas de controle e processamento especificas desta rotina.
 func rebuildCompanyTokenIndexLocked() {
 	companyTokens = make(map[string][]string)
 	spentTokenIDs = make(map[string]bool) // Correção: limpeza para state sync seguro
@@ -1854,11 +1922,13 @@ func rebuildCompanyTokenIndexLocked() {
 	}
 }
 
+// hashLedgerPayload executa as rotinas de controle e processamento especificas desta rotina.
 func hashLedgerPayload(payload string) string {
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])
 }
 
+// lastLedgerHash executa as rotinas de controle e processamento especificas desta rotina.
 func lastLedgerHash() string {
 	if len(ledgerRecords) == 0 {
 		return "genesis"
@@ -1866,6 +1936,7 @@ func lastLedgerHash() string {
 	return ledgerRecords[len(ledgerRecords)-1].Hash
 }
 
+// appendLedgerRecord executa as rotinas de controle e processamento especificas desta rotina.
 func appendLedgerRecord(rec LedgerRecord) LedgerRecord {
 	ledgerMutex.Lock()
 	defer ledgerMutex.Unlock()
@@ -1885,18 +1956,21 @@ func appendLedgerRecord(rec LedgerRecord) LedgerRecord {
 	return rec
 }
 
+// ledgerHasMintRound executa as rotinas de controle e processamento especificas desta rotina.
 func ledgerHasMintRound(roundID string) bool {
 	ledgerMutex.RLock()
 	defer ledgerMutex.RUnlock()
 	return mintRoundsDone[roundID]
 }
 
+// markMintRoundDone marca ou atualiza o status interno do sistema.
 func markMintRoundDone(roundID string) {
 	ledgerMutex.Lock()
 	mintRoundsDone[roundID] = true
 	ledgerMutex.Unlock()
 }
 
+// registerCompany executa as rotinas de controle e processamento especificas desta rotina.
 func registerCompany(companyID string) *Company {
 	ledgerMutex.Lock()
 	defer ledgerMutex.Unlock()
@@ -1908,6 +1982,7 @@ func registerCompany(companyID string) *Company {
 	return c
 }
 
+// companyInConsortium executa as rotinas de controle e processamento especificas desta rotina.
 func companyInConsortium(companyID string) bool {
 	ledgerMutex.RLock()
 	defer ledgerMutex.RUnlock()
@@ -1915,6 +1990,7 @@ func companyInConsortium(companyID string) bool {
 	return ok && c.InConsortium
 }
 
+// mintTokens emite novos tokens no ledger da economia distribuida.
 func mintTokens(companyID string, count int, recordType, mintRoundID, detail string) ([]*Token, LedgerRecord) {
 	ledgerMutex.Lock()
 	defer ledgerMutex.Unlock()
@@ -1953,6 +2029,7 @@ func mintTokens(companyID string, count int, recordType, mintRoundID, detail str
 	return created, rec
 }
 
+// companyForSector executa as rotinas de controle e processamento especificas desta rotina.
 func companyForSector(setor string) string {
 	switch strings.ToLower(setor) {
 	case "norte":
@@ -1967,6 +2044,7 @@ func companyForSector(setor string) string {
 	return ""
 }
 
+// autoSubmitSectorProblem executa as rotinas de controle e processamento especificas desta rotina.
 func autoSubmitSectorProblem(originalMsg Message) {
 	companyID := companyForSector(originalMsg.GatewayID)
 	if companyID == "" {
@@ -1991,6 +2069,7 @@ func autoSubmitSectorProblem(originalMsg Message) {
 	}
 }
 
+// activeTokenCount executa as rotinas de controle e processamento especificas desta rotina.
 func activeTokenCount(companyID string) int {
 	ledgerMutex.RLock()
 	defer ledgerMutex.RUnlock()
@@ -2003,6 +2082,7 @@ func activeTokenCount(companyID string) int {
 	return n
 }
 
+// selectActiveTokens executa as rotinas de controle e processamento especificas desta rotina.
 func selectActiveTokens(companyID string, needed int) ([]*Token, bool) {
 	ledgerMutex.Lock()
 	defer ledgerMutex.Unlock()
@@ -2022,6 +2102,7 @@ func selectActiveTokens(companyID string, needed int) ([]*Token, bool) {
 	return nil, false
 }
 
+// spendTokens executa as rotinas de controle e processamento especificas desta rotina.
 func spendTokens(tokens []*Token, txID, missionID string) []string {
 	ledgerMutex.Lock()
 	defer ledgerMutex.Unlock()
@@ -2041,6 +2122,7 @@ func spendTokens(tokens []*Token, txID, missionID string) []string {
 	return ids
 }
 
+// removeTokenFromCompanyIndexLocked executa as rotinas de controle e processamento especificas desta rotina.
 func removeTokenFromCompanyIndexLocked(companyID, tokenID string) {
 	list := companyTokens[companyID]
 	for i, id := range list {
@@ -2051,6 +2133,7 @@ func removeTokenFromCompanyIndexLocked(companyID, tokenID string) {
 	}
 }
 
+// tokensCostForPriority executa as rotinas de controle e processamento especificas desta rotina.
 func tokensCostForPriority(priority int) int {
 	if priority < 1 {
 		priority = 1
@@ -2061,6 +2144,7 @@ func tokensCostForPriority(priority int) int {
 	return priority
 }
 
+// priorityLabel executa as rotinas de controle e processamento especificas desta rotina.
 func priorityLabel(priority int) string {
 	switch priority {
 	case 1:
@@ -2076,6 +2160,7 @@ func priorityLabel(priority int) string {
 	}
 }
 
+// companyBalanceSummary executa as rotinas de controle e processamento especificas desta rotina.
 func companyBalanceSummary(companyID string) (tokens int, credits int) {
 	ledgerMutex.RLock()
 	defer ledgerMutex.RUnlock()
@@ -2088,6 +2173,7 @@ func companyBalanceSummary(companyID string) (tokens int, credits int) {
 	return tokens, credits
 }
 
+// ledgerRecordsByCompany executa as rotinas de controle e processamento especificas desta rotina.
 func ledgerRecordsByCompany(companyID string, limit int) []LedgerRecord {
 	ledgerMutex.RLock()
 	defer ledgerMutex.RUnlock()
@@ -2101,6 +2187,7 @@ func ledgerRecordsByCompany(companyID string, limit int) []LedgerRecord {
 	return out
 }
 
+// ledgerRecordsByMission executa as rotinas de controle e processamento especificas desta rotina.
 func ledgerRecordsByMission(missionID string) []LedgerRecord {
 	ledgerMutex.RLock()
 	defer ledgerMutex.RUnlock()
@@ -2113,6 +2200,7 @@ func ledgerRecordsByMission(missionID string) []LedgerRecord {
 	return out
 }
 
+// validateLedgerChain executa as rotinas de controle e processamento especificas desta rotina.
 func validateLedgerChain() bool {
 	ledgerMutex.RLock()
 	defer ledgerMutex.RUnlock()
@@ -2130,6 +2218,7 @@ func validateLedgerChain() bool {
 	return true
 }
 
+// exportLedgerSnapshot executa as rotinas de controle e processamento especificas desta rotina.
 func exportLedgerSnapshot() ([]LedgerRecord, map[string]*Token, map[string]*Company, map[string]bool) {
 	ledgerMutex.RLock()
 	defer ledgerMutex.RUnlock()
@@ -2151,6 +2240,7 @@ func exportLedgerSnapshot() ([]LedgerRecord, map[string]*Token, map[string]*Comp
 	return recs, toks, comps, rounds
 }
 
+// importLedgerSnapshot executa as rotinas de controle e processamento especificas desta rotina.
 func importLedgerSnapshot(recs []LedgerRecord, toks map[string]*Token, comps map[string]*Company, rounds map[string]bool) {
 	ledgerMutex.Lock()
 	defer ledgerMutex.Unlock()
@@ -2165,6 +2255,7 @@ func importLedgerSnapshot(recs []LedgerRecord, toks map[string]*Token, comps map
 	})
 }
 
+// applyLedgerRecordFromPeer executa as rotinas de controle e processamento especificas desta rotina.
 func applyLedgerRecordFromPeer(rec LedgerRecord) {
 	ledgerMutex.Lock()
 	defer ledgerMutex.Unlock()
@@ -2180,6 +2271,7 @@ func applyLedgerRecordFromPeer(rec LedgerRecord) {
 	ledgerSeq = len(ledgerRecords)
 }
 
+// initEconomy prepara as variaveis e inicializa configuracoes antes do main.
 func initEconomy() {
 	heap.Init(&creditWaitQueue)
 	loadLedgerFromDisk()
@@ -2187,6 +2279,7 @@ func initEconomy() {
 	go startPeriodicMintLoop()
 }
 
+// economyRALoop executa as rotinas de controle e processamento especificas desta rotina.
 func economyRALoop() {
 	for op := range economyOpPending {
 		runEconomyCriticalSection(op.run)
@@ -2194,12 +2287,14 @@ func economyRALoop() {
 	}
 }
 
+// runWithEconomyRA executa a acao passada de forma segura e sincronizada.
 func runWithEconomyRA(action func()) {
 	op := economyOp{run: action, done: make(chan struct{})}
 	economyOpPending <- op
 	<-op.done
 }
 
+// runEconomyCriticalSection executa a acao passada de forma segura e sincronizada.
 func runEconomyCriticalSection(action func()) {
 	stateMutex.Lock()
 	requestingCS[economyDroneID] = true // Correção: Removido if recursivo que causava deadlock
@@ -2232,15 +2327,18 @@ func runEconomyCriticalSection(action func()) {
 	}
 }
 
+// currentMintRoundID executa as rotinas de controle e processamento especificas desta rotina.
 func currentMintRoundID() string {
 	t := time.Now().Truncate(5 * time.Minute)
 	return fmt.Sprintf("MINT_ROUND_%s", t.Format("2006-01-02T15:04"))
 }
 
+// ensureCompanyRegistered executa as rotinas de controle e processamento especificas desta rotina.
 func ensureCompanyRegistered(companyID string) {
 	registerCompany(companyID)
 }
 
+// mintInitialCredits emite novos tokens no ledger da economia distribuida.
 func mintInitialCredits(companyID string) {
 	runWithEconomyRA(func() {
 		if activeTokenCount(companyID) > 0 {
@@ -2254,6 +2352,7 @@ func mintInitialCredits(companyID string) {
 	})
 }
 
+// executePeriodicMint inicia ou executa a rotina operacional principal.
 func executePeriodicMint() {
 	roundID := currentMintRoundID()
 	if ledgerHasMintRound(roundID) {
@@ -2285,6 +2384,7 @@ func executePeriodicMint() {
 	})
 }
 
+// startPeriodicMintLoop inicia o loop de tarefas ou processo em background.
 func startPeriodicMintLoop() {
 	intervalStr := os.Getenv("MINT_INTERVAL_SECONDS")
 	intervalSecs, err := strconv.Atoi(intervalStr)
@@ -2298,6 +2398,7 @@ func startPeriodicMintLoop() {
 	}
 }
 
+// replicateLedgerRecord executa as rotinas de controle e processamento especificas desta rotina.
 func replicateLedgerRecord(rec LedgerRecord) {
 	broadcastPeerMsg(Message{
 		Type:      MsgLedgerRecord,
@@ -2307,11 +2408,13 @@ func replicateLedgerRecord(rec LedgerRecord) {
 	})
 }
 
+// mustJSON valida a existencia do parametro vital ou aborta a execucao.
 func mustJSON(v interface{}) string {
 	b, _ := json.Marshal(v)
 	return string(b)
 }
 
+// handleLedgerRecordFromPeer processa a requisicao e executa a logica correspondente.
 func handleLedgerRecordFromPeer(msg Message) {
 	if msg.Content == "" {
 		return
@@ -2339,6 +2442,7 @@ func handleLedgerRecordFromPeer(msg Message) {
 	go persistLedgerToDisk()
 }
 
+// submitMissionRequest executa as rotinas de controle e processamento especificas desta rotina.
 func submitMissionRequest(msg Message) MissionSubmitResult {
 	companyID := msg.CompanyID
 	if companyID == "" {
@@ -2414,6 +2518,7 @@ func submitMissionRequest(msg Message) MissionSubmitResult {
 	return result
 }
 
+// buildAlertFromMessage monta ou cria a estrutura de dados solicitada.
 func buildAlertFromMessage(msg Message, companyID, missionID string, awaiting bool) *AlertRequest {
 	if msg.RequestID == "" {
 		msg.RequestID = fmt.Sprintf("%s:%s:%d", companyID, gatewayID, time.Now().UnixNano())
@@ -2431,6 +2536,7 @@ func buildAlertFromMessage(msg Message, companyID, missionID string, awaiting bo
 	}
 }
 
+// enqueueCreditWait adiciona o item na fila de processamento apropriada.
 func enqueueCreditWait(req *AlertRequest) {
 	creditWaitMutex.Lock()
 	heap.Push(&creditWaitQueue, req)
@@ -2439,6 +2545,7 @@ func enqueueCreditWait(req *AlertRequest) {
 	notifyQueueProcessor()
 }
 
+// enqueueAlertPaid adiciona o item na fila de processamento apropriada.
 func enqueueAlertPaid(req *AlertRequest) {
 	stateMutex.Lock()
 	if isRequestClaimed(req.RequestID) {
@@ -2475,6 +2582,7 @@ func enqueueAlertPaid(req *AlertRequest) {
 	})
 }
 
+// reprocessCreditWaitQueueAll executa as rotinas de controle e processamento especificas desta rotina.
 func reprocessCreditWaitQueueAll() {
 	creditWaitMutex.Lock()
 	pending := make([]*AlertRequest, 0, creditWaitQueue.Len())
@@ -2498,6 +2606,7 @@ func reprocessCreditWaitQueueAll() {
 	}
 }
 
+// handleTokenTransfer processa a requisicao e executa a logica correspondente.
 func handleTokenTransfer(msg Message, conn net.Conn) {
 	fromCompany := msg.CompanyID
 	var toCompany string
@@ -2556,6 +2665,7 @@ func handleTokenTransfer(msg Message, conn net.Conn) {
 	}
 }
 
+// reprocessCreditWaitForCompany executa as rotinas de controle e processamento especificas desta rotina.
 func reprocessCreditWaitForCompany(companyID string) {
 	creditWaitMutex.Lock()
 	remaining := make(PriorityQueue, 0)
@@ -2584,6 +2694,7 @@ func reprocessCreditWaitForCompany(companyID string) {
 	}
 }
 
+// recordMissionDispatch grava ou registra as informacoes para auditoria e controle.
 func recordMissionDispatch(missionID, companyID, droneID string) {
 	rec := appendLedgerRecord(LedgerRecord{
 		Type:      LedgerMissionDispatch,
@@ -2595,6 +2706,7 @@ func recordMissionDispatch(missionID, companyID, droneID string) {
 	replicateLedgerRecord(rec)
 }
 
+// recordMissionEvent grava ou registra as informacoes para auditoria e controle.
 func recordMissionEvent(msg Message) {
 	runWithEconomyRA(func() { // Correção: Inserido R-A para serialização de Ledger
 		rec := appendLedgerRecord(LedgerRecord{
@@ -2609,6 +2721,7 @@ func recordMissionEvent(msg Message) {
 	})
 }
 
+// recordMissionReport grava ou registra as informacoes para auditoria e controle.
 func recordMissionReport(msg Message) {
 	runWithEconomyRA(func() { // Correção: Inserido R-A para serialização de Ledger
 		rec := appendLedgerRecord(LedgerRecord{
@@ -2623,6 +2736,7 @@ func recordMissionReport(msg Message) {
 	})
 }
 
+// sendBalanceRep realiza o envio da mensagem ou pacote pela rede.
 func sendBalanceRep(conn net.Conn, companyID string) {
 	tokens, credits := companyBalanceSummary(companyID)
 	creditWaitMutex.Lock()
@@ -2641,27 +2755,15 @@ func sendBalanceRep(conn net.Conn, companyID string) {
 	})
 }
 
+// sendLedgerRep realiza o envio da mensagem ou pacote pela rede.
 func sendLedgerRep(conn net.Conn, companyID string, limit int) {
 	recs := ledgerRecordsByCompany(companyID, limit)
 	json.NewEncoder(conn).Encode(Message{Type: MsgLedgerRep, Content: mustJSON(recs)})
 }
 
-/******************************************************************************************
-
-Autor: Walace de Jesus Venas
-Componente Curricular: TEC502 MI- CONCORRÊNCIA E CONECTIVIDADE
-Concluído em: 14/05/2026
-Declaro que este código foi elaborado por mim de forma individual e não contêm nenhum
-trecho de código de outro colega ou de outro autor, tais como provindos de livros e
-apostilas, e páginas ou documentos eletrônicos da Internet. Qualquer trecho de código
-de outra autoria que não a minha está destacado com uma citação para o autor e a fonte
-do código, e estou ciente que estes trechos não serão considerados para fins de avaliação.
-Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-Agrawala.
-
-*******************************************************************************************/
-
 // --- TCP TRANSPORT ABSTRACTION ---
 
+// dialTransport estabelece uma nova conexao de rede TCP ou QUIC.
 func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
@@ -2670,6 +2772,7 @@ func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
 	return conn, nil
 }
 
+// listenTransport abre uma porta local e escuta por novas conexoes.
 func listenTransport(addr string) (net.Listener, error) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -2679,6 +2782,7 @@ func listenTransport(addr string) (net.Listener, error) {
 	return l, nil
 }
 
+// handleCompanyListReq processa a requisicao e executa a logica correspondente.
 func handleCompanyListReq(msg Message, conn net.Conn) {
 	ledgerMutex.RLock()
 	var companyIDs []string
@@ -2693,6 +2797,7 @@ func handleCompanyListReq(msg Message, conn net.Conn) {
 	json.NewEncoder(conn).Encode(Message{Type: MsgCompanyListRep, Content: string(content)})
 }
 
+// handleAdminCredit processa a requisicao e executa a logica correspondente.
 func handleAdminCredit(msg Message, conn net.Conn) {
 	companyID := msg.CompanyID
 	if companyID == "" && msg.Payload != nil {
@@ -2732,6 +2837,7 @@ func handleAdminCredit(msg Message, conn net.Conn) {
 	})
 }
 
+// handleRevenueReq processa a requisicao e executa a logica correspondente.
 func handleRevenueReq(msg Message, conn net.Conn) {
 	ledgerMutex.RLock()
 	totalArrecadado := 0
@@ -2752,6 +2858,7 @@ func handleRevenueReq(msg Message, conn net.Conn) {
 	json.NewEncoder(conn).Encode(Message{Type: MsgRevenueRep, Payload: payload})
 }
 
+// handleLedgerGlobalReq processa a requisicao e executa a logica correspondente.
 func handleLedgerGlobalReq(msg Message, conn net.Conn) {
 	limit := 50
 	if msg.Payload != nil {
@@ -2764,6 +2871,7 @@ func handleLedgerGlobalReq(msg Message, conn net.Conn) {
 	sendLedgerRep(conn, "", limit)
 }
 
+// handleSpentTokensReq processa a requisicao e executa a logica correspondente.
 func handleSpentTokensReq(msg Message, conn net.Conn) {
 	companyID := msg.CompanyID
 	if companyID == "" && msg.Payload != nil {
@@ -2809,3 +2917,17 @@ func handleSpentTokensReq(msg Message, conn net.Conn) {
 
 	json.NewEncoder(conn).Encode(Message{Type: MsgSpentTokensRep, Payload: payload})
 }
+
+/******************************************************************************************
+
+Autor: Walace de Jesus Venas
+Componente Curricular: TEC502 MI- CONCORRÊNCIA E CONECTIVIDADE
+Concluído em: 14/05/2026
+Declaro que este código foi elaborado por mim de forma individual e não contêm nenhum
+trecho de código de outro colega ou de outro autor, tais como provindos de livros e
+apostilas, e páginas ou documentos eletrônicos da Internet. Qualquer trecho de código
+de outra autoria que não a minha está destacado com uma citação para o autor e a fonte
+do código, e estou ciente que estes trechos não serão considerados para fins de avaliação.
+Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-Agrawala.
+
+*******************************************************************************************/

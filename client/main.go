@@ -73,6 +73,7 @@ var occurrenceOptions = []OccurrenceOption{
 // Navios genéricos usados silenciosamente para movimentar a economia do gateway
 var defaultCompanies = []string{"navio-norte", "navio-sul", "navio-leste", "navio-oeste"}
 
+// mustEnv valida a existencia do parametro vital ou aborta a execucao.
 func mustEnv(key string) string {
 	val := os.Getenv(key)
 	if val == "" {
@@ -81,6 +82,7 @@ func mustEnv(key string) string {
 	return val
 }
 
+// getAvailableGatewayConn obtem e retorna a informacao solicitada.
 func getAvailableGatewayConn(gateways map[string]string) (net.Conn, string, error) {
 	for name, addr := range gateways {
 		conn, err := dialTransport(addr, 1*time.Second)
@@ -91,6 +93,7 @@ func getAvailableGatewayConn(gateways map[string]string) (net.Conn, string, erro
 	return nil, "", fmt.Errorf("nenhum gateway disponível no momento")
 }
 
+// main inicializa o servico, as dependencias e os workers principais.
 func main() {
 	// Inicialização da seed para atribuição aleatória silenciosa
 	rand.Seed(time.Now().UnixNano())
@@ -175,6 +178,7 @@ func main() {
 	}
 }
 
+// sendManualAlert realiza o envio da mensagem ou pacote pela rede.
 func sendManualAlert(reader *bufio.Reader, sectors []string, gateways map[string]string, isEnvironmental bool) {
 	if isEnvironmental {
 		fmt.Println("--- INJETAR ALERTA AMBIENTAL (MOCK DE SENSOR) ---")
@@ -213,6 +217,7 @@ func sendManualAlert(reader *bufio.Reader, sectors []string, gateways map[string
 	sendWithFallback(msg, setorEscolhido, sectors, gateways)
 }
 
+// solveProblemMenu executa as rotinas de controle e processamento especificas desta rotina.
 func solveProblemMenu(reader *bufio.Reader, gateways map[string]string) {
 	offset := 0
 	limit := 5
@@ -306,6 +311,7 @@ func solveProblemMenu(reader *bufio.Reader, gateways map[string]string) {
 	}
 }
 
+// dispatchClientMission executa as rotinas de controle e processamento especificas desta rotina.
 func dispatchClientMission(reader *bufio.Reader, selected AlertRequest, gateways map[string]string) {
 	fmt.Printf("\nVocê selecionou o problema: %s\n", selected.Occurrence)
 
@@ -342,6 +348,7 @@ func dispatchClientMission(reader *bufio.Reader, selected AlertRequest, gateways
 	reader.ReadString('\n')
 }
 
+// printStatus exibe as informacoes e menus na interface de usuario.
 func printStatus(sectors []string, gateways map[string]string) {
 	fmt.Println("--- STATUS DO ESTREITO ---")
 
@@ -517,6 +524,7 @@ func printStatus(sectors []string, gateways map[string]string) {
 	bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
+// viewEventLog executa as rotinas de controle e processamento especificas desta rotina.
 func viewEventLog(reader *bufio.Reader, sectors []string, gateways map[string]string) {
 	fmt.Println("--- LOG DE EVENTOS ---")
 	fmt.Print("Quantos eventos deseja ver por setor? ")
@@ -572,6 +580,7 @@ func viewEventLog(reader *bufio.Reader, sectors []string, gateways map[string]st
 	reader.ReadString('\n')
 }
 
+// readChoice realiza a leitura de dados do terminal ou stream.
 func readChoice(reader *bufio.Reader) string {
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -582,6 +591,7 @@ func readChoice(reader *bufio.Reader) string {
 	return strings.TrimSpace(line)
 }
 
+// readNumber realiza a leitura de dados do terminal ou stream.
 func readNumber(reader *bufio.Reader, min, max int) int {
 	for {
 		line, err := reader.ReadString('\n')
@@ -599,6 +609,7 @@ func readNumber(reader *bufio.Reader, min, max int) int {
 	}
 }
 
+// sendWithFallback realiza o envio da mensagem ou pacote pela rede.
 func sendWithFallback(msg Message, initialSector string, sectors []string, gateways map[string]string) {
 	order := make([]string, 0, len(sectors))
 	order = append(order, initialSector)
@@ -650,12 +661,14 @@ func sendWithFallback(msg Message, initialSector string, sectors []string, gatew
 	bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
+// cleanDroneName executa as rotinas de controle e processamento especificas desta rotina.
 func cleanDroneName(droneID string) string {
 	droneID = strings.TrimPrefix(droneID, "drone_")
 	droneID = strings.TrimPrefix(droneID, "Drone_")
 	return strings.ReplaceAll(droneID, "_", "-")
 }
 
+// capitalizeFirst executa as rotinas de controle e processamento especificas desta rotina.
 func capitalizeFirst(text string) string {
 	if len(text) == 0 {
 		return text
@@ -663,6 +676,7 @@ func capitalizeFirst(text string) string {
 	return strings.ToUpper(string(text[0])) + text[1:]
 }
 
+// formatDroneName executa as rotinas de controle e processamento especificas desta rotina.
 func formatDroneName(droneID string) string {
 	id := strings.ToLower(droneID)
 	switch {
@@ -679,16 +693,19 @@ func formatDroneName(droneID string) string {
 	}
 }
 
+// clearScreen limpa a tela ou formatacao visual do terminal interativo.
 func clearScreen() {
 	fmt.Print("\033[H\033[2J\033[3J")
 }
 
+// clearMenuLines limpa a tela ou formatacao visual do terminal interativo.
 func clearMenuLines(linhas int) {
 	fmt.Printf("\033[%dA\033[J", linhas)
 }
 
 // --- TCP TRANSPORT ABSTRACTION ---
 
+// dialTransport estabelece uma nova conexao de rede TCP ou QUIC.
 func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
@@ -697,6 +714,7 @@ func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
 	return conn, nil
 }
 
+// listenTransport abre uma porta local e escuta por novas conexoes.
 func listenTransport(addr string) (net.Listener, error) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {

@@ -45,6 +45,7 @@ var (
 	currentCompanyID   string
 )
 
+// envOrDefault executa as rotinas de controle e processamento especificas desta rotina.
 func envOrDefault(key, def string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -53,6 +54,7 @@ func envOrDefault(key, def string) string {
 	return v
 }
 
+// mustEnv valida a existencia do parametro vital ou aborta a execucao.
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -61,6 +63,7 @@ func mustEnv(key string) string {
 	return v
 }
 
+// mustDurationEnv valida a existencia do parametro vital ou aborta a execucao.
 func mustDurationEnv(key string) time.Duration {
 	v := mustEnv(key)
 	if d, err := time.ParseDuration(v); err == nil {
@@ -73,6 +76,7 @@ func mustDurationEnv(key string) time.Duration {
 	return 0
 }
 
+// main inicializa o servico, as dependencias e os workers principais.
 func main() {
 	// Correção: seed removido (obsoleto e automático em Go recentes)
 	droneID = envOrDefault("DEVICE_ID", "Drone")
@@ -108,6 +112,7 @@ func main() {
 	startCommandListener(myControlAddr)
 }
 
+// locatePreferredGatewayBySector executa as rotinas de controle e processamento especificas desta rotina.
 func locatePreferredGatewayBySector(setorID string) int {
 	for i, name := range gatewayNames {
 		if strings.EqualFold(name, setorID) {
@@ -117,6 +122,7 @@ func locatePreferredGatewayBySector(setorID string) int {
 	return -1
 }
 
+// locatePreferredGatewayByIP executa as rotinas de controle e processamento especificas desta rotina.
 func locatePreferredGatewayByIP(deviceIP string) int {
 	ips := []string{mustEnv("IP_NORTE"), mustEnv("IP_SUL"), mustEnv("IP_LESTE"), mustEnv("IP_OESTE")}
 	for i, ip := range ips {
@@ -127,6 +133,7 @@ func locatePreferredGatewayByIP(deviceIP string) int {
 	return 0
 }
 
+// registerLoop executa as rotinas de controle e processamento especificas desta rotina.
 func registerLoop(controlAddr string, preferredIndex int) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	for {
@@ -138,6 +145,7 @@ func registerLoop(controlAddr string, preferredIndex int) {
 	}
 }
 
+// registerToGateway executa as rotinas de controle e processamento especificas desta rotina.
 func registerToGateway(controlAddr string, preferredIndex int) error {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	if preferredIndex < 0 || preferredIndex >= len(gatewayAddrs) {
@@ -171,6 +179,7 @@ func registerToGateway(controlAddr string, preferredIndex int) error {
 	return fmt.Errorf("nenhum gateway disponível")
 }
 
+// gatewayOrder executa as rotinas de controle e processamento especificas desta rotina.
 func gatewayOrder(preferredIndex int) []int {
 	order := make([]int, 0, len(gatewayAddrs))
 	if preferredIndex < 0 || preferredIndex >= len(gatewayAddrs) {
@@ -182,6 +191,7 @@ func gatewayOrder(preferredIndex int) []int {
 	return order
 }
 
+// tryRegisterGateway executa as rotinas de controle e processamento especificas desta rotina.
 func tryRegisterGateway(idx int, controlAddr string) error {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	addr := gatewayAddrs[idx]
@@ -219,6 +229,7 @@ func tryRegisterGateway(idx int, controlAddr string) error {
 	return nil
 }
 
+// heartbeatLoop executa as rotinas de controle e processamento especificas desta rotina.
 func heartbeatLoop(controlAddr string) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	for {
@@ -232,6 +243,7 @@ func heartbeatLoop(controlAddr string) {
 	}
 }
 
+// sendHeartbeat realiza o envio da mensagem ou pacote pela rede.
 func sendHeartbeat() error {
 	stateMutex.Lock()
 	addr := currentGateway
@@ -274,6 +286,7 @@ func sendHeartbeat() error {
 	return nil
 }
 
+// migrateGateway executa as rotinas de controle e processamento especificas desta rotina.
 func migrateGateway(controlAddr string) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	currentState := currentStatus()
@@ -305,6 +318,7 @@ func migrateGateway(controlAddr string) {
 	time.Sleep(5 * time.Second)
 }
 
+// startCommandListener inicia o loop de tarefas ou processo em background.
 func startCommandListener(controlAddr string) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	listenerAddr := controlAddr
@@ -323,6 +337,7 @@ func startCommandListener(controlAddr string) {
 	}
 }
 
+// handleCommand processa a requisicao e executa a logica correspondente.
 func handleCommand(conn net.Conn) {
 	defer conn.Close()
 	var msg Message
@@ -346,6 +361,7 @@ func handleCommand(conn net.Conn) {
 	startMission()
 }
 
+// startMission inicia o loop de tarefas ou processo em background.
 func startMission() {
 	stateMutex.Lock()
 	if missionActive {
@@ -400,6 +416,7 @@ func startMission() {
 	}()
 }
 
+// sendMissionEvent realiza o envio da mensagem ou pacote pela rede.
 func sendMissionEvent(missionID, companyID, detail string) {
 	if missionID == "" {
 		return
@@ -408,6 +425,7 @@ func sendMissionEvent(missionID, companyID, detail string) {
 	sendToCurrentGateway(msg)
 }
 
+// sendMissionReport realiza o envio da mensagem ou pacote pela rede.
 func sendMissionReport(missionID, companyID, report string) {
 	if missionID == "" {
 		return
@@ -416,6 +434,7 @@ func sendMissionReport(missionID, companyID, report string) {
 	sendToCurrentGateway(msg)
 }
 
+// sendToCurrentGateway realiza o envio da mensagem ou pacote pela rede.
 func sendToCurrentGateway(msg Message) {
 	stateMutex.Lock()
 	addr := currentGateway
@@ -431,6 +450,7 @@ func sendToCurrentGateway(msg Message) {
 	_ = json.NewEncoder(conn).Encode(msg)
 }
 
+// sendDroneFailureNotification realiza o envio da mensagem ou pacote pela rede.
 func sendDroneFailureNotification(reason string) {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	msg := Message{
@@ -459,6 +479,7 @@ func sendDroneFailureNotification(reason string) {
 	log.Printf("%s [FALHA] Não foi possível notificar nenhum gateway; continuarei tentando junto ao gateway atual", logPrefix)
 }
 
+// sendRelease realiza o envio da mensagem ou pacote pela rede.
 func sendRelease() {
 	logPrefix := fmt.Sprintf("[DRONE/%s]", droneID)
 	for {
@@ -493,12 +514,14 @@ func sendRelease() {
 	}
 }
 
+// currentStatus executa as rotinas de controle e processamento especificas desta rotina.
 func currentStatus() string {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
 	return statusValue
 }
 
+// currentMissionInfo executa as rotinas de controle e processamento especificas desta rotina.
 func currentMissionInfo() string {
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
@@ -513,6 +536,7 @@ func currentMissionInfo() string {
 
 // --- TCP TRANSPORT ABSTRACTION ---
 
+// dialTransport estabelece uma nova conexao de rede TCP ou QUIC.
 func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
@@ -521,6 +545,7 @@ func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
 	return conn, nil
 }
 
+// listenTransport abre uma porta local e escuta por novas conexoes.
 func listenTransport(addr string) (net.Listener, error) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {

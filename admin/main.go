@@ -27,6 +27,7 @@ type Message struct {
 	CompanyID string            `json:"company_id,omitempty"`
 }
 
+// mustEnv valida a existencia do parametro vital ou aborta a execucao.
 func mustEnv(key string) string {
 	val := os.Getenv(key)
 	if val == "" {
@@ -35,6 +36,7 @@ func mustEnv(key string) string {
 	return val
 }
 
+// getAvailableGatewayConn obtem e retorna a informacao solicitada.
 func getAvailableGatewayConn(gateways map[string]string) (net.Conn, string, error) {
 	for name, addr := range gateways {
 		conn, err := dialTransport(addr, 3*time.Second)
@@ -45,6 +47,7 @@ func getAvailableGatewayConn(gateways map[string]string) (net.Conn, string, erro
 	return nil, "", fmt.Errorf("nenhum gateway disponível no momento")
 }
 
+// getCompanyList obtem e retorna a informacao solicitada.
 func getCompanyList(gateways map[string]string) ([]string, error) {
 	conn, _, err := getAvailableGatewayConn(gateways)
 	if err != nil {
@@ -69,6 +72,7 @@ func getCompanyList(gateways map[string]string) ([]string, error) {
 	return list, nil
 }
 
+// selectCompany executa as rotinas de controle e processamento especificas desta rotina.
 func selectCompany(reader *bufio.Reader, gateways map[string]string) string {
 	fmt.Println("Conectando ao gateway para obter lista de empresas...")
 	list, err := getCompanyList(gateways)
@@ -98,6 +102,7 @@ func selectCompany(reader *bufio.Reader, gateways map[string]string) string {
 	}
 }
 
+// main inicializa o servico, as dependencias e os workers principais.
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
@@ -175,6 +180,7 @@ func main() {
 	}
 }
 
+// adminRegisterCompany executa as rotinas de controle e processamento especificas desta rotina.
 func adminRegisterCompany(reader *bufio.Reader, gateways map[string]string) {
 	fmt.Println("--- CADASTRAR NOVA EMPRESA / NAVIO ---")
 	fmt.Print("Digite o nome/ID da nova empresa (ou 0 para cancelar): ")
@@ -204,6 +210,7 @@ func adminRegisterCompany(reader *bufio.Reader, gateways map[string]string) {
 	reader.ReadString('\n')
 }
 
+// adminCredit executa as rotinas de controle e processamento especificas desta rotina.
 func adminCredit(reader *bufio.Reader, gateways map[string]string) {
 	fmt.Println("--- ADICIONAR TOKENS MANUALMENTE ---")
 	companyID := selectCompany(reader, gateways)
@@ -246,6 +253,7 @@ func adminCredit(reader *bufio.Reader, gateways map[string]string) {
 	reader.ReadString('\n')
 }
 
+// adminBalance executa as rotinas de controle e processamento especificas desta rotina.
 func adminBalance(reader *bufio.Reader, gateways map[string]string) {
 	fmt.Println("--- SALDO DA EMPRESA ---")
 	companyID := selectCompany(reader, gateways)
@@ -274,6 +282,7 @@ func adminBalance(reader *bufio.Reader, gateways map[string]string) {
 	reader.ReadString('\n')
 }
 
+// adminRevenue executa as rotinas de controle e processamento especificas desta rotina.
 func adminRevenue(reader *bufio.Reader, gateways map[string]string) {
 	fmt.Println("--- ARRECADAÇÃO DO CONSÓRCIO HORMUZ ---")
 	conn, _, err := getAvailableGatewayConn(gateways)
@@ -305,6 +314,7 @@ func adminRevenue(reader *bufio.Reader, gateways map[string]string) {
 	reader.ReadString('\n')
 }
 
+// adminAudit executa as rotinas de controle e processamento especificas desta rotina.
 func adminAudit(reader *bufio.Reader, gateways map[string]string) {
 	for {
 		clearScreen()
@@ -329,6 +339,7 @@ func adminAudit(reader *bufio.Reader, gateways map[string]string) {
 	}
 }
 
+// adminLedgerGlobal executa as rotinas de controle e processamento especificas desta rotina.
 func adminLedgerGlobal(reader *bufio.Reader, gateways map[string]string) {
 	fmt.Println("\n--- LEDGER GLOBAL ---")
 	conn, gwName, err := getAvailableGatewayConn(gateways)
@@ -379,6 +390,7 @@ func adminLedgerGlobal(reader *bufio.Reader, gateways map[string]string) {
 	reader.ReadString('\n')
 }
 
+// adminLedgerCompany executa as rotinas de controle e processamento especificas desta rotina.
 func adminLedgerCompany(reader *bufio.Reader, gateways map[string]string) {
 	fmt.Println("\n--- LEDGER POR EMPRESA ---")
 	companyID := selectCompany(reader, gateways)
@@ -428,6 +440,7 @@ func adminLedgerCompany(reader *bufio.Reader, gateways map[string]string) {
 	reader.ReadString('\n')
 }
 
+// adminSpentTokens executa as rotinas de controle e processamento especificas desta rotina.
 func adminSpentTokens(reader *bufio.Reader, gateways map[string]string) {
 	fmt.Println("\n--- TOKENS GASTOS POR EMPRESA ---")
 	companyID := selectCompany(reader, gateways)
@@ -459,6 +472,7 @@ func adminSpentTokens(reader *bufio.Reader, gateways map[string]string) {
 	reader.ReadString('\n')
 }
 
+// readChoice realiza a leitura de dados do terminal ou stream.
 func readChoice(reader *bufio.Reader) string {
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -469,16 +483,19 @@ func readChoice(reader *bufio.Reader) string {
 	return strings.TrimSpace(line)
 }
 
+// clearScreen limpa a tela ou formatacao visual do terminal interativo.
 func clearScreen() {
 	fmt.Print("\033[H\033[2J\033[3J")
 }
 
+// clearMenuLines limpa a tela ou formatacao visual do terminal interativo.
 func clearMenuLines(linhas int) {
 	fmt.Printf("\033[%dA\033[J", linhas)
 }
 
 // --- TCP TRANSPORT ABSTRACTION ---
 
+// dialTransport estabelece uma nova conexao de rede TCP ou QUIC.
 func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {

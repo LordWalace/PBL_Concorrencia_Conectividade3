@@ -44,6 +44,7 @@ func envOrDefault(key, def string) string {
 	return v
 }
 
+// mustEnv valida a existencia do parametro vital ou aborta a execucao.
 func mustEnv(key string) string {
 	value := os.Getenv(key)
 	if value == "" {
@@ -187,6 +188,7 @@ Implementação baseada no algoritmo distribuído de exclusão mútua de Ricart-
 
 // --- TCP TRANSPORT ABSTRACTION ---
 
+// dialTransport estabelece uma nova conexao de rede TCP ou QUIC.
 func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
@@ -195,6 +197,7 @@ func dialTransport(addr string, timeout time.Duration) (net.Conn, error) {
 	return conn, nil
 }
 
+// listenTransport abre uma porta local e escuta por novas conexoes.
 func listenTransport(addr string) (net.Listener, error) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
