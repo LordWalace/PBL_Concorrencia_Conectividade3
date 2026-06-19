@@ -1,4 +1,4 @@
-﻿# Sistema HORMUZ
+# Sistema HORMUZ
 
 Um sistema distribuido de coordenação de drones para quatro setores (Norte, Sul, Leste, Oeste) com foco em tolerância a falhas, exclusão mútua distribuída e redundância de rede.
 
@@ -32,8 +32,8 @@ Este projeto implementa uma malha distribuida sem leader, sem ponto unico de fal
 - **Gateway** — coordena alertas, replicas de fila, dispatch de drones e mantem o ledger distribuido local.
 - **Beacon** — gera alertas autonomos e faz failover para gateways ativos.
 - **Device** — registra-se, envia heartbeats e executa comandos de despacho.
-- **Client** — interface interativa para injetar alertas, contratar serviços e consultar status/saldo.
-- **Admin** — painel de administracao do consorcio, emissao de tokens e auditoria global do ledger.
+- **Client** — interface interativa para visualizar o status do estreito, injetar alertas e contratar serviços de drones.
+- **Admin** — painel de administracao do consorcio, emissao de tokens, auditoria do ledger e consulta de saldos/faturamento.
 
 ---
 
@@ -50,8 +50,8 @@ Este projeto implementa uma malha distribuida sem leader, sem ponto unico de fal
            │                 │                 │                 │
 ┌──────────┴─────────┐ ┌─────┴──────┐ ┌────────┴────────┐ ┌──────┴─────┐
 │      BEACON        │ │   CLIENT   │ │      ADMIN      │ │   DEVICE   │
-│  entrega alertas   │ │ injeta req │ │ emite tokens e  │ │   recebe   │
-│  com failover TCP  │ │  e saldo   │ │  audita ledger  │ │  dispatch  │
+│  entrega alertas   │ │ injeta req │ │ emite tokens,   │ │   recebe   │
+│  com failover TCP  │ │ e patrulha │ │ saldos e ledger │ │  dispatch  │
 └────────────────────┘ └────────────┘ └─────────────────┘ └────────────┘
 ```
 
@@ -160,6 +160,7 @@ Esse root compose é o caminho recomendado quando todos os serviços precisam ro
 
 - Inicie todos os gateways antes de subir devices e beacons.
 - O `client` injeta alertas manuais e valida `ALERT_ACK`.
+- O `admin` emite tokens para as frotas e audita os registros financeiros da malha.
 - O `gateway` replica alertas, negocia exclusao mutua e dispara drones com `DISPATCH`.
 - O `device` mantem heartbeat e migra para outro gateway se a conexao falhar.
 
@@ -238,6 +239,7 @@ O cliente trata gateways offline de forma silenciosa: ele exibe `OFFLINE` quando
 - Beacon: `docker compose logs beacon-norte`
 - Device: `docker compose logs drone-norte`
 - Client: `docker compose logs client`
+- Admin: `docker compose logs admin`
 
 ---
 
@@ -246,3 +248,13 @@ O cliente trata gateways offline de forma silenciosa: ele exibe `OFFLINE` quando
 - Cada `main.go` em `gateway/`, `device/`, `beacon/` e `client/` contem um bloco de declaracao academica de autoria.
 - O `gateway` usa Ricart-Agrawala para exclusao mutua e Lamport para ordenacao de eventos.
 - A arquitetura foi projetada para funcionar com IPs reais de rede e sem `localhost`.
+
+---
+
+## Segurança do Ledger Distribuído
+
+A economia de Tokens do Consórcio Hormuz é gerenciada por um Ledger Distribuído (Livro-Razão) interno ao cluster de Gateways, protegido pelas seguintes garantias:
+
+1. **Criptografia Hash (Blockchain):** Cada bloco (`LedgerRecord`) inserido no registro gera uma assinatura SHA-256 única baseada no seu conteúdo combinada com o `Hash` do bloco anterior. Isso cria uma cadeia imutável, onde a adulteração de um registro passaria a invalidar todos os blocos subsequentes.
+2. **Prevenção de Gasto-Duplo via Ricart-Agrawala:** Qualquer transação financeira (pagamento de missão, transferência ou emissão de moedas) requer que o Gateway adquira um bloqueio exclusivo global (`__economy__`) utilizando o algoritmo de Ricart-Agrawala. Isso previne condições de corrida onde duas empresas tentariam gastar o mesmo Token ao mesmo tempo.
+3. **Replicação P2P:** Após uma transação ser processada de forma mutuamente exclusiva, o novo bloco é transmitido em broadcast para os demais Gateways que o validam contra os IDs de tokens e hashes conhecidos, garantindo que nenhum servidor assuma uma realidade paralela. Se um gateway cai, ele sincroniza sua cadeia com a rede através do snapshot do Ledger assim que reinicia.
